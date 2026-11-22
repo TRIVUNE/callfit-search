@@ -1,0 +1,15 @@
+{
+  "name": "Trivune GbR",
+  "city": "Berlin",
+  "country": "DE",
+  "regions": ["Berlin", "DE", "EU", "World"],
+  "entities": ["individual", "collective", "gbr"],
+  "has": ["open_source", "germany_based", "berlin_residence", "berlin_brandenburg", "finished_work", "product_idea"],
+  "interests": [
+    "signal processing", "mathematics", "quantum computing", "algorithms",
+    "research software", "research", "open source", "software", "tools",
+    "audiovisual", "sound art", "spatial audio", "immersive", "reverb", "machine learning",
+    "audio", "music technology", "instruments", "interfaces", "computer music", "electroacoustic",
+    "workshops", "education", "installation", "art science", "media art", "digital"
+  ]
+}
