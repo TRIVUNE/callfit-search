@@ -215,7 +215,6 @@ const CONFS_TOPICS: &[&str] = &[
 
 /// Web search queries. {Y} becomes the coming season's year.
 const QUERIES: &[&str] = &[
-    // first five also go to Brave
     "open call sound art {Y}", "call for papers audio signal processing {Y}", "music technology hackathon {Y}",
     "Ausschreibung Klangkunst {Y}", "KVR Developer Challenge {Y}",
     // games, XR, showcases, online competitions
@@ -285,9 +284,11 @@ const QUERIES: &[&str] = &[
 ];
 
 const ENGINES: &[(&str, &str)] = &[
+    ("Seznam", "https://search.seznam.cz/?q="),
     ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
     ("Brave", "https://search.brave.com/search?q="),
-    ("Startpage", "https://www.startpage.com/do/search?q="),
+    // the old /do/search address answers bots with a CAPTCHA
+    ("Startpage", "https://www.startpage.com/sp/search?query="),
 ];
 
 pub enum Msg {
@@ -357,7 +358,7 @@ re!(
 );
 re!(
     re_engine_host,
-    r"(?i)(?:^|\.)(?:duckduckgo\.com|brave\.com|startpage\.com|google\.[a-z.]+|bing\.com|microsoft\.com|yahoo\.com|yandex\.[a-z]+|wikipedia\.org|wikimedia\.org|facebook\.com|instagram\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|pinterest\.[a-z.]+|reddit\.com|amazon\.[a-z.]+)$"
+    r"(?i)(?:^|\.)(?:duckduckgo\.com|brave\.com|startpage\.com|(?:o-)?seznam\.cz|google\.[a-z.]+|bing\.com|microsoft\.com|yahoo\.com|yandex\.[a-z]+|wikipedia\.org|wikimedia\.org|facebook\.com|instagram\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|pinterest\.[a-z.]+|reddit\.com|amazon\.[a-z.]+)$"
 );
 re!(
     re_next,
@@ -509,7 +510,7 @@ fn host(url: &str) -> String {
 }
 
 /// URL without scheme, www, fragment, tracking params and trailing slash: for de-duplication.
-fn url_key(url: &str) -> String {
+pub fn url_key(url: &str) -> String {
     let u = url.split('#').next().unwrap_or(url);
     let (path, query) = u.split_once('?').unwrap_or((u, ""));
     let q: Vec<&str> = query.split('&').filter(|p| !p.is_empty() && !p.starts_with("utm_") && !p.starts_with("ref=")).collect();
@@ -1242,7 +1243,12 @@ pub fn harvest_search(engine: &str, page: &str, need_kw: bool, today: NaiveDate)
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for c in re_anchor().captures_iter(page) {
-        let Some(href) = attr(re_href(), c.get(1).unwrap().as_str()) else { continue };
+        let attrs = c.get(1).unwrap().as_str();
+        // favicon, site name and shown-URL links come before the title link (Startpage, Seznam)
+        if ["favicon-link", "wgl-site-title", "wgl-display-url", "data-e-a=\"reference\""].iter().any(|k| attrs.contains(k)) {
+            continue;
+        }
+        let Some(href) = attr(re_href(), attrs) else { continue };
         let mut url = decode_entities(href);
         if let Some(i) = url.find("uddg=") {
             url = percent_decode(url[i + 5..].split('&').next().unwrap_or(""));
@@ -1528,7 +1534,8 @@ fn pace(h: &str) -> (usize, u64) {
     match h {
         "search.brave.com" => (1, 1200),
         "html.duckduckgo.com" => (1, 1500),
-        "startpage.com" => (6, 0),
+        "startpage.com" => (2, 500),
+        "search.seznam.cz" => (1, 1000),
         _ => (PER_HOST, 0),
     }
 }
@@ -1699,29 +1706,31 @@ fn first_jobs(today: NaiveDate) -> Vec<Job> {
             v.push(j);
         }
     }
-    // web search, most important queries first. Startpage takes every query; Brave allows ~5
-    // per run and DuckDuckGo blocks fast, so they get a share. User queries: data_dir/queries.json
+    // web search: engines block a computer that sends them many queries, so each run sends a
+    // few. User queries (data_dir/queries.json) always go; built-in ones take turns by day.
+    // Each query goes to one engine, in turn.
     let sy = season_year(today).to_string();
     let mut queries: Vec<String> = read_user_list::<String>("queries.json");
-    queries.extend(QUERIES.iter().map(|q| q.replace("{Y}", &sy)));
+    let mut builtin: Vec<String> = QUERIES.iter().map(|q| q.replace("{Y}", &sy)).collect();
+    if !builtin.is_empty() {
+        let at = (today.ordinal() as usize * SEARCHES_PER_RUN) % builtin.len();
+        builtin.rotate_left(at);
+    }
+    queries.extend(builtin);
     let mut seen_q = HashSet::new();
     queries.retain(|q| seen_q.insert(q.to_lowercase()));
+    queries.truncate(SEARCHES_PER_RUN.max(read_user_list::<String>("queries.json").len()));
     for (i, q) in queries.iter().enumerate() {
-        for (name, base) in ENGINES {
-            let take = match *name {
-                "Brave" => i < 5,
-                "DuckDuckGo" => i % 3 == 0,
-                _ => true,
-            };
-            if take {
-                let mut j = job(&format!("{}: {}", name, q), format!("{}{}", base, urlencode(q)), How::Search);
-                j.term = name.to_string();
-                v.push(j);
-            }
-        }
+        let (name, base) = ENGINES[i % ENGINES.len()];
+        let mut j = job(&format!("{}: {}", name, q), format!("{}{}", base, urlencode(q)), How::Search);
+        j.term = name.to_string();
+        v.push(j);
     }
     v
 }
+
+/// Web searches per live run (more get the computer blocked by the engines).
+const SEARCHES_PER_RUN: usize = 16;
 
 /// Parse one fetched page: (candidates, follow-up jobs).
 fn parse(job: &Job, final_url: &str, body: &str, today: NaiveDate) -> (Vec<Cand>, Vec<Job>) {
@@ -1765,25 +1774,57 @@ fn parse(job: &Job, final_url: &str, body: &str, today: NaiveDate) -> (Vec<Cand>
     }
 }
 
-/// One query typed by the user: results of the first engine that answers. Startpage first (it
-/// serves Google's results); Google itself answers bots with a CAPTCHA.
-pub fn web_search(query: &str, today: NaiveDate) -> Result<Vec<Opportunity>, String> {
-    let agent = agent();
-    let mut why = Vec::new();
-    for (name, base) in ENGINES.iter().rev() {
-        let job = Job { source: name.to_string(), url: format!("{}{}", base, urlencode(query)), how: How::Search, page: 1, term: String::new() };
-        match fetch(&agent, &job) {
-            Ok((_, body)) => {
-                let found = harvest_search(name, &body, false, today);
-                if !found.is_empty() {
-                    return Ok(found);
+/// Passed deadline, an old round, or the page says it is closed.
+fn is_passed(o: &Opportunity, today: NaiveDate) -> bool {
+    crate::model::parse_date(&o.deadline).map(|d| d < today).unwrap_or(false) || stale(&o.name, today) || o.warnings.iter().any(|w| w == CLOSED)
+}
+
+/// One query typed by the user: every engine at once (Startpage serves Google's results; Google
+/// itself answers bots with a CAPTCHA), merged in rank order. Drops duplicates and pages in
+/// `known` (url keys of entries already in the list).
+pub fn web_search(query: &str, known: &HashSet<String>, today: NaiveDate) -> Result<Vec<Opportunity>, String> {
+    let asks: Vec<_> = ENGINES
+        .iter()
+        .rev()
+        .map(|&(name, base)| {
+            let job = Job { source: name.to_string(), url: format!("{}{}", base, urlencode(query)), how: How::Search, page: 1, term: String::new() };
+            std::thread::spawn(move || match fetch(&agent(), &job) {
+                Ok((_, body)) => {
+                    let v = harvest_search(name, &body, false, today);
+                    if v.is_empty() { Err(format!("{}: no results", name)) } else { Ok(v) }
                 }
-                why.push(format!("{}: no results", name));
-            }
-            Err(e) => why.push(format!("{}: {}", name, e)),
+                Err(e) => Err(format!("{}: {}", name, e)),
+            })
+        })
+        .collect();
+    let (mut lists, mut why) = (vec![], vec![]);
+    for a in asks {
+        match a.join() {
+            Ok(Ok(v)) => lists.push(v),
+            Ok(Err(e)) => why.push(e),
+            Err(_) => why.push("a search engine crashed".to_string()),
         }
     }
-    Err(why.join(", "))
+    // each engine's 1st result, then each one's 2nd...
+    let mut seen = known.clone();
+    let mut out = vec![];
+    for i in 0..lists.iter().map(Vec::len).max().unwrap_or(0) {
+        for o in lists.iter().filter_map(|l| l.get(i)) {
+            if seen.insert(url_key(&o.apply_url)) {
+                out.push(o.clone());
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(if lists.is_empty() { why.join(", ") } else { "every result is already in your list".to_string() });
+    }
+    Ok(out)
+}
+
+/// Read result pages at once for deadline, dates and amount; drop closed and passed calls.
+pub fn read_pages(v: Vec<Opportunity>, today: NaiveDate) -> Vec<Opportunity> {
+    let reads: Vec<_> = v.into_iter().map(|o| std::thread::spawn(move || read_page(o, false, today))).collect();
+    reads.into_iter().filter_map(|r| r.join().ok()).filter(|o| !is_passed(o, today)).collect()
 }
 
 /// Read one search result's own page for deadline, dates and amount, like the crawl does.
@@ -1804,8 +1845,8 @@ pub fn link_entry(url: &str, today: NaiveDate) -> Opportunity {
     read_page(live_item(&h, h.clone(), url, url, String::new(), today), true, today)
 }
 
-/// Engine for searches about one site; Startpage takes the most queries per run.
-const SITE_ENGINE: &str = "https://www.startpage.com/do/search?q=";
+/// Engine for searches about one site.
+const SITE_ENGINE: &str = "https://www.startpage.com/sp/search?query=";
 
 /// A site that blocks reading (login, CAPTCHA, JavaScript): search the web for it instead.
 fn site_search(o: &Opportunity) -> Job {
@@ -1824,10 +1865,7 @@ fn run(tx: Sender<Msg>, today: NaiveDate) {
     let agent = agent();
     let (rtx, rrx) = channel();
     let pool = Pool::start(&agent, rtx);
-    // passed deadline, an old round, or the page says it is closed
-    let passed = |o: &Opportunity| {
-        crate::model::parse_date(&o.deadline).map(|d| d < today).unwrap_or(false) || stale(&o.name, today) || o.warnings.iter().any(|w| w == CLOSED)
-    };
+    let passed = |o: &Opportunity| is_passed(o, today);
 
     let jobs = first_jobs(today);
     let mut visited: HashSet<String> = jobs.iter().map(|j| url_key(&j.url)).collect();
@@ -2163,6 +2201,12 @@ mod tests {
         // Brave: breadcrumb before the title
         let brave = r#"<a href="https://www.airwiggles.com/c/announcements/aircon26" class="l1"><div>Airwiggles airwiggles.com › c › announcements › aircon26 AirCon26: the free online audio conference | Airwiggles</div></a>"#;
         assert_eq!(harvest_search("Brave", brave, false, today())[0].name, "AirCon26: the free online audio conference");
+        let seznam = r#"<h3><a class="ef854e36a42" data-e-a="heading" href="https://soundartlab.org/residency/"><span><b class=sec>Residency</b> – <b class=sec>Sound Art</b> Lab</span></a></h3><a data-e-a="reference" href="https://soundartlab.org/residency/"><span>soundartlab.org</span><span>/<b class=sec>residency</b></span></a><a href="https://search.seznam.cz/obrazky/">Obrázky</a>"#;
+        let v = harvest_search("Seznam", seznam, false, today());
+        assert_eq!((v.len(), v[0].name.as_str()), (1, "Residency – Sound Art Lab"));
+        let sp = r#"<a href="https://resartis.org/open-calls/" class="favicon-link css-1"><span>x</span></a><a href="https://resartis.org/open-calls/" class="wgl-site-title css-3"><span class="link-text">Res Artis</span></a><a class="result-title result-link css-11" href="https://resartis.org/open-calls/"><h2 class="wgl-title">Open Calls - Res Artis</h2></a><a href="https://o-seznam.cz/napoveda/prohlizece/">Najít jiný prohlížeč</a>"#;
+        let v = harvest_search("Startpage", sp, false, today());
+        assert_eq!((v.len(), v[0].name.as_str()), (1, "Open Calls - Res Artis"));
     }
 
     #[test]
@@ -2203,6 +2247,21 @@ Bewerbungsschluss ist der 28. Februar 2027.</p><footer>© 2026</footer></body></
         assert!(old_post("December 2, 2025 - Apply to speak at AirCon26!", t));
         assert!(!old_post("November 10, 2026 - Apply to speak at AirCon27!", t));
         assert!(!old_post("Apply to speak at AirCon27 by 2 December 2027", t));
+    }
+
+    /// Real search engines: `cargo test --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn web_search_live() {
+        let v = web_search("sound art residency open call", &HashSet::new(), today()).unwrap();
+        for o in &v {
+            println!("{} | {} | {}", o.cadence, o.name, o.apply_url);
+        }
+        let read = read_pages(v.into_iter().take(10).collect(), today());
+        for o in &read {
+            println!("{:?} | {} | {:?}", o.deadline, o.name, o.warnings);
+        }
+        assert!(!read.is_empty());
     }
 
     #[test]

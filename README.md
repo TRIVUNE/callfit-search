@@ -1,6 +1,6 @@
 # callfit
 
-Find funding, open calls, residencies and paper calls that fit **Trivune**. A terminal app in the look of [trivune.com](https://trivune.com), written in Rust.
+Find funding, open calls, residencies and paper calls that fit **Trivune**. A terminal app in the style of [llmfit](https://www.llmfit.org/), written in Rust.
 
 callfit scores each opportunity against your profile and shows a fit level, a score breakdown, the money, the deadline and the apply link.
 
@@ -49,7 +49,7 @@ If `scoop` is not found after the install, open a new terminal.
 | `Enter` | Open the call page |
 | `i` | Open the page it was found on |
 | `p` | Track: Watching → Drafting → Submitted → Won → Rejected |
-| `/` | Filter the list: all fields, accents ignored (`foerderung` finds `Förderung`), `-word` excludes. If nothing matches, `Enter` searches the web |
+| `/` | Filter the list. Words match at their start (`art` finds `artist`, not `start`) and in 8 languages (`residency` finds `Residenz`, `résidence`, `residencia`). `"sound art"` matches the phrase, `-word` excludes, accents are ignored. Name matches come first. With no exact match, one typo is forgiven. If nothing matches, `Enter` searches the web |
 | `t` | Filter by type |
 | `r` | Filter by region (Berlin, DE, EU, World) |
 | `f` | Filter by fit (Eligible, Perfect+Good, All) |
@@ -57,10 +57,10 @@ If `scoop` is not found after the install, open a new terminal.
 | `s` | Sort (Score, Match, Deadline, Amount, Name) |
 | `v` | Show tracked only |
 | `u` | Live search now (also runs at start when saved results are over 24 hours old) |
-| `w` | Search the web for anything not in the list. In the results: `Enter` opens one, `a` adds it to your list (saved in `opportunities.json`) |
+| `w` | Search the web for anything not in the list: Startpage, Brave, DuckDuckGo and Seznam at once, without results already in your list. The top 10 pages are read for deadline and amount; closed or past calls are hidden. In the results: `Enter` opens one, `a` adds it to your list (saved in `opportunities.json`) |
 | `x` | Export the current list to CSV |
 | `e` | Open the data folder |
-| `m` | Switch between dark (charcoal) and light (light grey) theme |
+| `m` | Switch between dark and light theme |
 | `J` `K` | Scroll the detail panel |
 | `q` | Quit |
 
@@ -72,7 +72,7 @@ One run takes at most 60 seconds and finds about 2,000 entries. It reads, in par
 
 - about 150 listing sites: open-call aggregators, funders in Berlin, Germany, Austria, the Netherlands and the EU, universities and music schools in Germany and abroad, math and quantum institutes, festivals, audio/DSP/music-tech conferences, hackathon and challenge boards, game jams;
 - feeds and APIs: WikiCFP (39 fields from DSP and audio to pure math and quantum), Devpost hackathons, confs.tech talk calls, EU Funding & Tenders;
-- web search (Startpage, Brave, DuckDuckGo) with about 135 queries in English, German, French, Spanish, Italian, Dutch, Portuguese, Polish and Swedish/Danish.
+- web search (Startpage, Brave, DuckDuckGo, Seznam): 16 queries per run, one engine each, taking turns by day through about 135 queries in English, German, French, Spanish, Italian, Dutch, Portuguese, Polish and Swedish/Danish.
 
 Then it opens each result's own page and reads the deadline, the event dates and the amount, in all these languages. Results stay saved in `live.json` for 21 days.
 
