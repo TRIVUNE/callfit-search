@@ -277,6 +277,8 @@ pub fn score(o: &Opportunity, p: &Profile, today: NaiveDate) -> Scored {
         Status::Unknown
     };
     let timing = match status {
+        // dates guessed from last year's pattern: the round is not announced yet
+        Status::Open | Status::Upcoming if o.confidence == "pattern" => 40,
         Status::Open => match days_left.unwrap_or(99) {
             d if d >= 21 => 100,
             d if d >= 7 => 80,
@@ -401,6 +403,22 @@ pub fn load_opportunities() -> (Vec<Opportunity>, usize) {
         }
     }
     (list, extra)
+}
+
+/// Add or replace one entry in data_dir/opportunities.json (web search "add").
+pub fn save_user_opportunity(o: &Opportunity) -> Result<(), String> {
+    let path = data_dir().join("opportunities.json");
+    let mut list: Vec<Opportunity> = match std::fs::read_to_string(&path) {
+        // never overwrite a file the user edited by hand and broke
+        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{} is not valid JSON ({}): fix it first", path.display(), e))?,
+        Err(_) => vec![],
+    };
+    match list.iter_mut().find(|x| x.id == o.id) {
+        Some(x) => *x = o.clone(),
+        None => list.push(o.clone()),
+    }
+    let s = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+    std::fs::write(&path, s).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

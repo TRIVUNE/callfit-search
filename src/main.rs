@@ -7,26 +7,73 @@ use chrono::{Local, NaiveDate};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use model::*;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Row, Table, TableState, Wrap},
     DefaultTerminal, Frame,
 };
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-// palette
-const BORDER: Color = Color::Rgb(0x3b, 0x42, 0x61);
-const DIM: Color = Color::Rgb(0x63, 0x6d, 0xa6);
-const FG: Color = Color::Rgb(0xc8, 0xd3, 0xf5);
-const GREEN: Color = Color::Rgb(0xc3, 0xe8, 0x8d);
-const BLUE: Color = Color::Rgb(0x82, 0xaa, 0xff);
-const CYAN: Color = Color::Rgb(0x86, 0xe1, 0xfc);
-const YELLOW: Color = Color::Rgb(0xff, 0xc7, 0x77);
-const RED: Color = Color::Rgb(0xff, 0x75, 0x7f);
-const SEL: Color = Color::Rgb(0x2f, 0x33, 0x4d);
+/// trivune.com palette: ink on charcoal (dark) or light grey (light), one red accent.
+struct Theme {
+    bg: Color,
+    ink: Color,
+    muted: Color,
+    faint: Color,
+    line: Color,
+    sel: Color,
+    /// the red of the TRIVUNE wordmark's V: bars, marks, the mode chip
+    red: Color,
+    /// red that stays readable as text on `bg`
+    red_text: Color,
+}
+const DARK: Theme = Theme {
+    bg: Color::Rgb(0x1f, 0x1f, 0x1f),
+    ink: Color::Rgb(0xf2, 0xf2, 0xf2),
+    muted: Color::Rgb(0xa8, 0xa8, 0xa8),
+    faint: Color::Rgb(0x7a, 0x7a, 0x7a),
+    line: Color::Rgb(0x3a, 0x3a, 0x3a),
+    sel: Color::Rgb(0x2e, 0x2e, 0x2e),
+    red: Color::Rgb(0xb3, 0x12, 0x1b),
+    red_text: Color::Rgb(0xf2, 0x55, 0x5a),
+};
+const LIGHT: Theme = Theme {
+    bg: Color::Rgb(0xec, 0xec, 0xec),
+    ink: Color::Rgb(0x11, 0x11, 0x11),
+    muted: Color::Rgb(0x55, 0x55, 0x55),
+    faint: Color::Rgb(0x73, 0x73, 0x73),
+    line: Color::Rgb(0xc8, 0xc8, 0xc8),
+    sel: Color::Rgb(0xdc, 0xdc, 0xdc),
+    red: Color::Rgb(0xb3, 0x12, 0x1b),
+    red_text: Color::Rgb(0xb3, 0x12, 0x1b),
+};
+static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
+
+fn th() -> &'static Theme {
+    if LIGHT_MODE.load(Ordering::Relaxed) { &LIGHT } else { &DARK }
+}
+
+fn fg(c: Color) -> Style {
+    Style::default().fg(c)
+}
+
+/// data_dir/theme.txt holds "light" or "dark"
+fn load_theme() {
+    let light = std::fs::read_to_string(data_dir().join("theme.txt")).map(|s| s.trim() == "light").unwrap_or(false);
+    LIGHT_MODE.store(light, Ordering::Relaxed);
+}
+
+fn toggle_theme() -> &'static str {
+    let light = !LIGHT_MODE.load(Ordering::Relaxed);
+    LIGHT_MODE.store(light, Ordering::Relaxed);
+    let name = if light { "light" } else { "dark" };
+    let _ = std::fs::write(data_dir().join("theme.txt"), name);
+    name
+}
 
 const KINDS: &[&str] = &["All", "Grant", "Prize", "Stipend", "Residency", "Fellowship", "Call for papers", "Open call", "Competition", "Hackathon", "Conference", "Accelerator", "Live"];
 const REGIONS: &[&str] = &["All", "Berlin", "DE", "EU", "World"];
@@ -38,7 +85,18 @@ const VIEWS: &[&str] = &["All", "Tracked"];
 #[derive(PartialEq)]
 enum Mode {
     Normal,
+    /// `/`: filter the list
     Search,
+    /// `w`: typing a web search
+    Web,
+    /// web search results popup
+    WebResults,
+}
+
+enum WebMsg {
+    /// (query, results or why there are none)
+    Results(String, Result<Vec<Opportunity>, String>),
+    Added(Opportunity),
 }
 
 struct App {
@@ -63,6 +121,12 @@ struct App {
     detail_scroll: u16,
     #[allow(dead_code)]
     user_entries: usize,
+    web_query: String,
+    web_results: Vec<Opportunity>,
+    web_list: ListState,
+    web_status: String,
+    web_tx: Sender<WebMsg>,
+    web_rx: Receiver<WebMsg>,
 }
 
 impl App {
@@ -74,6 +138,7 @@ impl App {
         let live_count = cached.len();
         opps.extend(cached);
         let all = opps.iter().map(|o| score(o, &profile, today)).collect();
+        let (web_tx, web_rx) = channel();
         let mut app = App {
             today,
             profile,
@@ -95,6 +160,12 @@ impl App {
             toast: None,
             detail_scroll: 0,
             user_entries,
+            web_query: String::new(),
+            web_results: vec![],
+            web_list: ListState::default(),
+            web_status: String::new(),
+            web_tx,
+            web_rx,
         };
         app.refilter();
         app.table.select(Some(0));
@@ -265,6 +336,83 @@ impl App {
         }
     }
 
+    /// The computer's date changed (app open past midnight): score everything again.
+    fn check_day(&mut self) {
+        let now = Local::now().date_naive();
+        if now != self.today {
+            self.today = now;
+            self.all = self.all.iter().map(|s| score(&s.opp, &self.profile, now)).collect();
+            self.refilter();
+        }
+    }
+
+    fn start_web(&mut self) {
+        let q = self.web_query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let (tx, today) = (self.web_tx.clone(), self.today);
+        self.mode = Mode::WebResults;
+        self.web_results.clear();
+        self.web_list.select(None);
+        if q.starts_with("http://") || q.starts_with("https://") {
+            // a pasted link: add that page directly
+            self.web_status = format!("Adding {}: reading the page…", q);
+            std::thread::spawn(move || {
+                let _ = tx.send(WebMsg::Added(added(live::link_entry(&q, today))));
+            });
+            return;
+        }
+        self.web_status = format!("Searching the web for \"{}\"…", q);
+        std::thread::spawn(move || {
+            let res = live::web_search(&q, today);
+            let _ = tx.send(WebMsg::Results(q, res));
+        });
+    }
+
+    fn add_web(&mut self) {
+        let Some(o) = self.web_list.selected().and_then(|i| self.web_results.get(i)).cloned() else { return };
+        let (tx, today) = (self.web_tx.clone(), self.today);
+        self.web_status = format!("Adding \"{}\": reading its page…", o.name);
+        std::thread::spawn(move || {
+            let _ = tx.send(WebMsg::Added(added(live::read_page(o, false, today))));
+        });
+    }
+
+    fn poll_web(&mut self) {
+        while let Ok(m) = self.web_rx.try_recv() {
+            match m {
+                WebMsg::Results(q, _) if q != self.web_query.trim() => {} // an older search
+                WebMsg::Results(_, Ok(v)) => {
+                    self.web_status = format!("{} results {} · Enter: open · a: add to your list", v.len(), v[0].cadence);
+                    self.web_results = v;
+                    self.web_list.select(Some(0));
+                }
+                WebMsg::Results(_, Err(e)) => {
+                    self.web_status = format!("Nothing found ({}). o: search in your browser, then paste a link with w to add it", e)
+                }
+                WebMsg::Added(o) => match save_user_opportunity(&o) {
+                    Err(e) => self.web_status = format!("Could not save: {}", e),
+                    Ok(()) => {
+                        let s = score(&o, &self.profile, self.today);
+                        match self.all.iter_mut().find(|x| x.opp.id == o.id) {
+                            Some(x) => *x = s,
+                            None => self.all.push(s),
+                        }
+                        self.refilter();
+                        let at = self.shown.iter().position(|&i| self.all[i].opp.id == o.id);
+                        if at.is_some() {
+                            self.table.select(at);
+                        }
+                        let hidden = if at.is_none() { " (hidden by the current filters)" } else { "" };
+                        self.web_status = format!("Added \"{}\" to your list{}", o.name, hidden);
+                        self.toast(self.web_status.clone());
+                    }
+                },
+            }
+        }
+    }
+
     fn export(&mut self) {
         let name = format!("callfit_{}.csv", Local::now().format("%Y%m%d_%H%M"));
         let path = std::env::current_dir().unwrap_or_default().join(&name);
@@ -298,6 +446,14 @@ impl App {
     }
 }
 
+/// A web result the user adds: own id and confidence, so a live run never replaces it and the
+/// live cache never duplicates it.
+fn added(mut o: Opportunity) -> Opportunity {
+    o.id = o.id.replacen("live:", "web:", 1);
+    o.confidence = "added".into();
+    o
+}
+
 fn where_text(o: &Opportunity) -> String {
     match (o.city.is_empty(), o.country.is_empty()) {
         (false, false) => format!("{}, {}", o.city, o.country),
@@ -320,135 +476,124 @@ fn short_kind(k: &str) -> String {
 
 fn match_color(m: u8) -> Color {
     match m {
-        8..=10 => GREEN,
-        5..=7 => BLUE,
-        2..=4 => YELLOW,
-        _ => DIM,
+        5..=10 => th().ink,
+        2..=4 => th().muted,
+        _ => th().faint,
     }
 }
 
 fn fit_color(f: FitLevel) -> Color {
     match f {
-        FitLevel::Perfect => GREEN,
-        FitLevel::Good => CYAN,
-        FitLevel::Marginal => YELLOW,
-        FitLevel::Low => DIM,
-        FitLevel::NotEligible => RED,
+        FitLevel::Perfect | FitLevel::Good => th().ink,
+        FitLevel::Marginal => th().muted,
+        FitLevel::Low => th().faint,
+        FitLevel::NotEligible => th().red_text,
     }
+}
+
+/// guessed from last year's dates, not announced yet
+fn guessed(s: &Scored) -> bool {
+    s.opp.confidence == "pattern" && matches!(s.status, Status::Open | Status::Upcoming)
 }
 
 fn deadline_cell(s: &Scored) -> (String, String, Color) {
+    let t = th();
+    if guessed(s) {
+        let month = parse_date(&s.opp.deadline).map(|d| d.format("~%b %Y").to_string()).unwrap_or_default();
+        return (month, "expected".into(), t.faint);
+    }
     match s.status {
         Status::Open => {
             let d = s.days_left.unwrap_or(0);
-            let c = if d <= 7 { RED } else if d <= 30 { YELLOW } else { GREEN };
-            (s.opp.deadline.clone().unwrap_or_default(), format!("{}d", d), c)
+            (s.opp.deadline.clone().unwrap_or_default(), format!("{}d", d), if d <= 7 { t.red_text } else { t.ink })
         }
         Status::Upcoming => (
-            s.opp.deadline.clone().map(|d| format!("~{}", d)).unwrap_or_else(|| "upcoming".into()),
+            s.opp.deadline.clone().unwrap_or_else(|| "upcoming".into()),
             format!("opens {}d", s.days_to_open.unwrap_or(0)),
-            BLUE,
+            t.muted,
         ),
-        Status::Rolling => ("rolling".into(), "anytime".into(), GREEN),
-        Status::Closed => ("closed".into(), "see next".into(), DIM),
-        Status::Unknown => ("check site".into(), "—".into(), DIM),
+        Status::Rolling => ("rolling".into(), "anytime".into(), t.ink),
+        Status::Closed => ("closed".into(), "see next".into(), t.faint),
+        Status::Unknown => ("check site".into(), "—".into(), t.faint),
     }
 }
 
-fn boxed<'a>(title: &'a str) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(format!(" {} ", title), Style::default().fg(DIM)))
+fn bold(c: Color) -> Style {
+    Style::default().fg(c).add_modifier(Modifier::BOLD)
+}
+
+/// One text input: red bar when active, placeholder when empty.
+fn input(label: &str, key: &str, text: &str, hint: &str, active: bool) -> Line<'static> {
+    let t = th();
+    let mut v = vec![
+        Span::styled(if active { " ▍" } else { "  " }, fg(t.red)),
+        Span::styled(format!("{} ", label), if active { bold(t.ink) } else { fg(t.muted) }),
+        Span::styled(format!("{}  ", key), fg(t.faint)),
+    ];
+    if text.is_empty() && !active {
+        v.push(Span::styled(hint.to_string(), fg(t.faint)));
+    } else {
+        v.push(Span::styled(format!("{}{}", text, if active { "▏" } else { "" }), fg(t.ink)));
+    }
+    Line::from(v)
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    let t = th();
     let area = f.area();
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(5), Constraint::Length(1)])
-        .split(area);
+    f.render_widget(Block::default().style(Style::default().bg(t.bg).fg(t.ink)), area);
+    let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(3), Constraint::Min(5), Constraint::Length(1)]).split(area);
+    let hairline = Block::default().borders(Borders::BOTTOM).border_style(fg(t.line));
 
-    // ---- header
+    // ---- header: wordmark, then counts
     let open_now = app.all.iter().filter(|s| matches!(s.status, Status::Open | Status::Rolling) && s.fit != FitLevel::NotEligible).count();
     let eligible = app.all.iter().filter(|s| s.fit != FitLevel::NotEligible).count();
     let tracked = app.tracker.values().filter(|t| **t != Track::None).count();
-    let sep = Span::styled("  │  ", Style::default().fg(BORDER));
-    let header = Line::from(vec![
-        Span::styled("Profile: ", Style::default().fg(DIM)),
-        Span::styled(format!("{} · {}, {}", app.profile.name, app.profile.city, app.profile.country), Style::default().fg(FG)),
-        sep.clone(),
-        Span::styled("Entries: ", Style::default().fg(DIM)),
-        Span::styled(format!("{}", app.all.len()), Style::default().fg(CYAN)),
-        sep.clone(),
-        Span::styled("Eligible: ", Style::default().fg(DIM)),
-        Span::styled(format!("{}", eligible), Style::default().fg(CYAN)),
-        sep.clone(),
-        Span::styled("Apply now: ", Style::default().fg(DIM)),
-        Span::styled(format!("{}", open_now), Style::default().fg(GREEN)),
-        sep.clone(),
-        Span::styled("Tracked: ", Style::default().fg(DIM)),
-        Span::styled(format!("{}", tracked), Style::default().fg(YELLOW)),
-        sep.clone(),
-        Span::styled("Live: ", Style::default().fg(DIM)),
-        Span::styled(app.live_status.clone(), Style::default().fg(YELLOW)),
-        sep,
-        Span::styled(app.today.format("%d %b %Y").to_string(), Style::default().fg(DIM)),
-    ]);
-    let hb = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(" callfit ", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)));
-    f.render_widget(Paragraph::new(header).block(hb), rows[0]);
-
-    // ---- filters
-    let fc = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(20),
-            Constraint::Length(17),
-            Constraint::Length(12),
-            Constraint::Length(16),
-            Constraint::Length(13),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ])
-        .split(rows[1]);
-    let search_style = if app.mode == Mode::Search { Style::default().fg(GREEN) } else { Style::default().fg(BORDER) };
-    let qtext = if app.query.is_empty() && app.mode != Mode::Search {
-        Span::styled("sound art, quantum, residency…", Style::default().fg(DIM))
-    } else {
-        Span::styled(
-            format!("{}{}", app.query, if app.mode == Mode::Search { "▏" } else { "" }),
-            Style::default().fg(FG),
-        )
-    };
-    f.render_widget(Paragraph::new(qtext).block(boxed("Search [/]").border_style(search_style)), fc[0]);
-    let vals = [
-        ("Type [t]", KINDS[app.kind]),
-        ("Region [r]", REGIONS[app.region]),
-        ("Fit [f]", FITS[app.fit]),
-        ("Status [o]", STATUSES[app.status]),
-        ("Sort [s]", SORTS[app.sort]),
-        ("View [v]", VIEWS[app.view]),
+    let mut head = vec![
+        Span::styled(" TRI", bold(t.ink)),
+        Span::styled("V", bold(t.red)),
+        Span::styled("UNE", bold(t.ink)),
+        Span::styled("  callfit", fg(t.muted)),
+        Span::raw("      "),
     ];
-    for (i, (t, v)) in vals.iter().enumerate() {
-        f.render_widget(
-            Paragraph::new(Span::styled(*v, Style::default().fg(GREEN))).block(boxed(t)),
-            fc[i + 1],
-        );
+    for (n, label) in [(app.all.len(), "entries"), (eligible, "eligible"), (open_now, "apply now"), (tracked, "tracked")] {
+        head.push(Span::styled(format!("{} ", n), fg(t.ink)));
+        head.push(Span::styled(format!("{}    ", label), fg(t.muted)));
     }
+    head.push(Span::styled("live ", fg(t.muted)));
+    head.push(Span::styled(format!("{}    ", app.live_status), fg(t.ink)));
+    head.push(Span::styled(app.today.format("%a %d %b %Y").to_string(), fg(t.muted)));
+    f.render_widget(Paragraph::new(Line::from(head)).block(hairline.clone()), rows[0]);
+
+    // ---- the two searches, then the filters (a changed filter shows in red)
+    let lines = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(hairline.inner(rows[1]));
+    f.render_widget(hairline.clone(), rows[1]);
+    let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(lines[0]);
+    f.render_widget(Paragraph::new(input("Filter the list", "/", &app.query, "sound art, quantum, residency…", app.mode == Mode::Search)), halves[0]);
+    f.render_widget(
+        Paragraph::new(input("Search the web", "w", &app.web_query, "anything not in the list, or paste a link", app.mode == Mode::Web)),
+        halves[1],
+    );
+    let mut opts = vec![Span::raw("  ")];
+    for (label, key, i, vals) in [
+        ("Type", "t", app.kind, KINDS),
+        ("Region", "r", app.region, REGIONS),
+        ("Fit", "f", app.fit, FITS),
+        ("Status", "o", app.status, STATUSES),
+        ("Sort", "s", app.sort, SORTS),
+        ("View", "v", app.view, VIEWS),
+    ] {
+        opts.push(Span::styled(format!("{} ", label), fg(t.muted)));
+        opts.push(Span::styled(format!("{} ", key), fg(t.faint)));
+        opts.push(Span::styled(vals[i], if i == 0 { fg(t.ink) } else { bold(t.red_text) }));
+        opts.push(Span::raw("     "));
+    }
+    f.render_widget(Paragraph::new(Line::from(opts)), lines[1]);
 
     // ---- main
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(57), Constraint::Percentage(43)])
-        .split(rows[2]);
+    let main = Layout::horizontal([Constraint::Percentage(57), Constraint::Percentage(43)]).split(rows[2]);
 
-    let header_row = Row::new(["", "Opportunity", "Type", "Amount", "Deadline", "Left", "Where", "Match", "Score"])
-        .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
+    let header_row = Row::new(["", "Opportunity", "Type", "Amount", "Deadline", "Left", "Where", "Match", "Score"]).style(bold(t.muted));
     let rows_v: Vec<Row> = app
         .shown
         .iter()
@@ -456,22 +601,25 @@ fn ui(f: &mut Frame, app: &mut App) {
             let s = &app.all[i];
             let o = &s.opp;
             let (dl, left, dc) = deadline_cell(s);
-            let tr = app.track(&o.id);
-            let mark = if tr != Track::None { "★" } else { "●" };
+            let mark = if app.track(&o.id) != Track::None { Span::styled("★", fg(t.red_text)) } else { Span::styled("●", fg(fit_color(s.fit))) };
+            let mut name = vec![];
+            if !o.warnings.is_empty() {
+                name.push(Span::styled("⚠ ", fg(t.red_text)));
+            }
+            name.push(Span::styled(o.name.clone(), fg(t.ink)));
             Row::new(vec![
-                Cell::from(Span::styled(mark, Style::default().fg(fit_color(s.fit)))),
-                Cell::from(Span::styled(if o.warnings.is_empty() { o.name.clone() } else { format!("⚠ {}", o.name) }, Style::default().fg(FG))),
-                Cell::from(Span::styled(short_kind(&o.kind), Style::default().fg(CYAN))),
-                Cell::from(Span::styled(fmt_amount(o), Style::default().fg(YELLOW))),
-                Cell::from(Span::styled(dl, Style::default().fg(dc))),
-                Cell::from(Span::styled(left, Style::default().fg(dc))),
-                Cell::from(Span::styled(where_text(o), Style::default().fg(DIM))),
-                Cell::from(Span::styled(format!("{:>2}/10", s.match10), Style::default().fg(match_color(s.match10)))),
-                Cell::from(Span::styled(format!("{:.0}", s.overall), Style::default().fg(fit_color(s.fit)))),
+                Cell::from(mark),
+                Cell::from(Line::from(name)),
+                Cell::from(Span::styled(short_kind(&o.kind), fg(t.muted))),
+                Cell::from(Span::styled(fmt_amount(o), fg(t.ink))),
+                Cell::from(Span::styled(dl, fg(dc))),
+                Cell::from(Span::styled(left, fg(dc))),
+                Cell::from(Span::styled(where_text(o), fg(t.muted))),
+                Cell::from(Span::styled(format!("{:>2}/10", s.match10), fg(match_color(s.match10)))),
+                Cell::from(Span::styled(format!("{:.0}", s.overall), fg(fit_color(s.fit)))),
             ])
         })
         .collect();
-    let title = format!("Opportunities ({}/{})", app.shown.len(), app.all.len());
     let table = Table::new(
         rows_v,
         [
@@ -487,56 +635,80 @@ fn ui(f: &mut Frame, app: &mut App) {
         ],
     )
     .header(header_row)
-    .row_highlight_style(Style::default().bg(SEL).add_modifier(Modifier::BOLD))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(BORDER))
-            .title(Span::styled(format!(" {} ", title), Style::default().fg(BLUE))),
-    );
+    .row_highlight_style(Style::default().bg(t.sel).add_modifier(Modifier::BOLD))
+    .highlight_symbol(Span::styled("▌", fg(t.red)))
+    .highlight_spacing(HighlightSpacing::Always)
+    .block(Block::default().title(Line::from(vec![
+        Span::styled(" Opportunities  ", bold(t.ink)),
+        Span::styled(format!("{} of {}", app.shown.len(), app.all.len()), fg(t.muted)),
+    ])));
     f.render_stateful_widget(table, main[0], &mut app.table);
 
     // ---- detail
-    let detail = detail_lines(app);
-    let db = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .title(Span::styled(
-            format!(" {} ", app.current().map(|s| s.opp.name.as_str()).unwrap_or("Details")),
-            Style::default().fg(FG).add_modifier(Modifier::BOLD),
-        ));
+    let db = Block::default().borders(Borders::LEFT).border_style(fg(t.line)).padding(Padding::horizontal(1));
     f.render_widget(
-        Paragraph::new(detail).block(db).wrap(Wrap { trim: false }).scroll((app.detail_scroll, 0)),
+        Paragraph::new(detail_lines(app)).block(db).wrap(Wrap { trim: false }).scroll((app.detail_scroll, 0)),
         main[1],
     );
 
     // ---- footer
-    let mode = if app.mode == Mode::Search { " SEARCH " } else { " NORMAL " };
-    let mut foot = vec![
-        Span::styled(mode, Style::default().fg(Color::Black).bg(GREEN).add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-    ];
+    let mode = match app.mode {
+        Mode::Normal => " LIST ",
+        Mode::Search => " FILTER ",
+        Mode::Web | Mode::WebResults => " WEB ",
+    };
+    let mut foot = vec![Span::styled(mode, Style::default().fg(Color::White).bg(t.red).add_modifier(Modifier::BOLD)), Span::raw(" ")];
     if let Some((msg, at)) = &app.toast {
         if at.elapsed() < Duration::from_secs(4) {
-            foot.push(Span::styled(msg.clone(), Style::default().fg(YELLOW)));
+            foot.push(Span::styled(msg.clone(), fg(t.ink)));
         }
     }
     if foot.len() == 2 {
-        let keys = if app.mode == Mode::Search {
-            "type to filter · Enter/Esc: done · Ctrl+U: clear"
-        } else {
-            "↑↓/jk:nav  Enter:apply  i:info  p:track  /:search  t r f o s v:filters  u:live  w:web  x:export  e:data  J/K:scroll  q:quit"
+        let keys = match app.mode {
+            Mode::Search => "type to filter · Enter: done (no matches: search the web) · Esc: done · Ctrl+U: clear",
+            Mode::Web => "type what to find, or paste a link to add it · Enter: go · Esc: cancel · Ctrl+U: clear",
+            Mode::WebResults => "↑↓: pick · Enter: open · a: add to your list · o: search in your browser · w: new search · Esc: close",
+            Mode::Normal => "↑↓/jk:nav  Enter:apply  i:info  p:track  /:filter  w:web search  t r f o s v:filters  u:live  x:export  e:data  m:theme  J/K:scroll  q:quit",
         };
-        foot.push(Span::styled(keys, Style::default().fg(DIM)));
+        foot.push(Span::styled(keys, fg(t.muted)));
     }
     f.render_widget(Paragraph::new(Line::from(foot)), rows[3]);
 
-    if app.all.is_empty() {
-        let r = centered(area, 40, 5);
+    // ---- web search results
+    if app.mode == Mode::WebResults {
+        let r = centered(area, area.width.saturating_sub(8).min(110), area.height.saturating_sub(6).min(32));
         f.render_widget(Clear, r);
-        f.render_widget(Paragraph::new("No data").block(boxed("callfit")), r);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(fg(t.line))
+            .style(Style::default().bg(t.bg))
+            .padding(Padding::horizontal(1))
+            .title(Line::from(vec![Span::styled(" ▍", fg(t.red)), Span::styled(format!("Web search: {} ", app.web_query.trim()), bold(t.ink))]))
+            .title_bottom(Line::from(Span::styled(format!(" {} ", app.web_status), fg(t.muted))));
+        let items: Vec<ListItem> = app
+            .web_results
+            .iter()
+            .map(|o| {
+                ListItem::new(vec![
+                    Line::from(Span::styled(o.name.clone(), bold(t.ink))),
+                    Line::from(Span::styled(format!("{} · {}", o.org, o.summary), fg(t.muted))),
+                    Line::raw(""),
+                ])
+            })
+            .collect();
+        // highlight_style's red only reaches the bar: the spans keep their own colours
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().bg(t.sel).fg(t.red))
+            .highlight_symbol("▌ ")
+            .highlight_spacing(HighlightSpacing::Always);
+        f.render_stateful_widget(list, r, &mut app.web_list);
+    }
+
+    if app.all.is_empty() {
+        let r = centered(area, 40, 3);
+        f.render_widget(Clear, r);
+        f.render_widget(Paragraph::new(" No data").style(Style::default().bg(t.bg)).block(Block::default().borders(Borders::ALL).border_style(fg(t.line))), r);
     }
 }
 
@@ -545,81 +717,76 @@ fn centered(a: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn kv(k: &str, v: impl Into<String>, c: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" {:<14}", k), Style::default().fg(DIM)),
-        Span::styled(v.into(), Style::default().fg(c)),
-    ])
+    Line::from(vec![Span::styled(format!(" {:<14}", k), fg(th().muted)), Span::styled(v.into(), fg(c))])
 }
 
 fn section(t: &str) -> Line<'static> {
-    Line::from(Span::styled(format!(" ── {} ──", t), Style::default().fg(CYAN)))
+    Line::from(vec![Span::styled(" ▍", fg(th().red)), Span::styled(t.to_string(), bold(th().ink))])
 }
 
 fn detail_lines(app: &App) -> Vec<Line<'static>> {
+    let t = th();
     let Some(s) = app.current() else {
-        return vec![Line::from(Span::styled(" Nothing matches these filters.", Style::default().fg(DIM)))];
+        return vec![Line::from(Span::styled(" Nothing matches these filters.", fg(t.muted)))];
     };
     let o = &s.opp;
-    let mut l = vec![Line::raw("")];
-    l.push(kv("Organisation:", o.org.clone(), FG));
-    l.push(kv("Type:", o.kind.clone(), CYAN));
-    l.push(kv("Where:", where_text(o), FG));
-    l.push(kv("Open to:", scope_text(&o.scope).to_string(), FG));
-    l.push(kv("Money:", fmt_amount(o), YELLOW));
+    let mut l = vec![Line::from(Span::styled(format!(" {}", o.name), bold(t.ink))), Line::raw("")];
+    l.push(kv("Organisation:", o.org.clone(), t.ink));
+    l.push(kv("Type:", o.kind.clone(), t.ink));
+    l.push(kv("Where:", where_text(o), t.ink));
+    l.push(kv("Open to:", scope_text(&o.scope).to_string(), t.ink));
+    l.push(kv("Money:", fmt_amount(o), t.ink));
     if !o.amount_note.is_empty() {
-        l.push(Line::from(Span::styled(format!("                {}", o.amount_note), Style::default().fg(DIM))));
+        l.push(Line::from(Span::styled(format!("                {}", o.amount_note), fg(t.muted))));
     }
     let (dl, left, dc) = deadline_cell(s);
     let deadline_txt = match s.status {
+        _ if guessed(s) => format!("{}  (guessed from last year's dates: not announced yet)", dl),
         Status::Open => format!("{}  ({} left)", dl, left.replace('d', " days")),
-        Status::Upcoming => format!(
-            "{}  (opens in {} days{})",
-            o.deadline.clone().unwrap_or_else(|| "date tbc".into()),
-            s.days_to_open.unwrap_or(0),
-            if o.confidence == "pattern" { ", expected" } else { "" }
-        ),
+        Status::Upcoming => format!("{}  (opens in {} days)", o.deadline.clone().unwrap_or_else(|| "date tbc".into()), s.days_to_open.unwrap_or(0)),
         _ => dl,
     };
     l.push(kv("Deadline:", format!("{}  (apply / submit)", deadline_txt), dc));
     if !o.event.is_empty() {
-        l.push(kv("Event:", o.event.clone(), FG));
+        l.push(kv("Event:", o.event.clone(), t.ink));
     }
     if let Some(op) = &o.opens {
-        l.push(kv("Opens:", op.clone(), FG));
+        l.push(kv("Opens:", op.clone(), t.ink));
     }
     if !o.cadence.is_empty() {
-        l.push(kv("Cadence:", o.cadence.clone(), FG));
+        l.push(kv("Cadence:", o.cadence.clone(), t.ink));
     }
     if !o.next_expected.is_empty() {
-        l.push(kv("Next:", o.next_expected.clone(), FG));
+        l.push(kv("Next:", o.next_expected.clone(), t.ink));
     }
     let conf = match o.confidence.as_str() {
-        "verified" => ("verified", GREEN),
-        "pattern" => ("dates from yearly pattern", YELLOW),
-        "live" => ("live listing, not checked", YELLOW),
-        _ => ("check on site", RED),
+        "verified" => ("verified", t.ink),
+        "pattern" => ("dates guessed from last year: not announced yet", t.red_text),
+        "live" => ("live listing, not checked", t.muted),
+        "added" => ("added by you from a web search", t.ink),
+        _ => ("check on site", t.red_text),
     };
     l.push(kv("Data:", format!("{} · checked {}", conf.0, o.checked), conf.1));
     for w in &o.warnings {
-        l.push(kv("⚠", w.clone(), RED));
+        l.push(kv("⚠", w.clone(), t.red_text));
     }
 
     l.push(Line::raw(""));
-    l.push(section("Score Breakdown"));
+    l.push(section("Score"));
     l.push(Line::raw(""));
     l.push(Line::from(vec![
-        Span::styled(" Overall:      ", Style::default().fg(DIM)),
-        Span::styled(format!("{:.1} / 100", s.overall), Style::default().fg(fit_color(s.fit)).add_modifier(Modifier::BOLD)),
+        Span::styled(" Overall:      ", fg(t.muted)),
+        Span::styled(format!("{:.1} / 100", s.overall), bold(fit_color(s.fit))),
     ]));
     l.push(Line::from(vec![
-        Span::styled(" Eligibility: ", Style::default().fg(DIM)),
-        Span::styled(format!("{:<4}", s.eligibility), Style::default().fg(FG)),
-        Span::styled("Relevance: ", Style::default().fg(DIM)),
-        Span::styled(format!("{:<4}", s.relevance), Style::default().fg(FG)),
-        Span::styled("Money: ", Style::default().fg(DIM)),
-        Span::styled(format!("{:<4}", s.money), Style::default().fg(FG)),
-        Span::styled("Timing: ", Style::default().fg(DIM)),
-        Span::styled(format!("{}", s.timing), Style::default().fg(FG)),
+        Span::styled(" Eligibility: ", fg(t.muted)),
+        Span::styled(format!("{:<4}", s.eligibility), fg(t.ink)),
+        Span::styled("Relevance: ", fg(t.muted)),
+        Span::styled(format!("{:<4}", s.relevance), fg(t.ink)),
+        Span::styled("Money: ", fg(t.muted)),
+        Span::styled(format!("{:<4}", s.money), fg(t.ink)),
+        Span::styled("Timing: ", fg(t.muted)),
+        Span::styled(format!("{}", s.timing), fg(t.ink)),
     ]));
     l.push(kv(
         "Match:",
@@ -628,37 +795,31 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
     ));
 
     l.push(Line::raw(""));
-    l.push(section("Trivune Fit"));
+    l.push(section("Trivune fit"));
     l.push(Line::raw(""));
-    l.push(Line::from(vec![
-        Span::styled(" Fit Level:    ", Style::default().fg(DIM)),
-        Span::styled(format!("● {}", s.fit.label()), Style::default().fg(fit_color(s.fit)).add_modifier(Modifier::BOLD)),
-    ]));
+    l.push(Line::from(vec![Span::styled(" Fit Level:    ", fg(t.muted)), Span::styled(format!("● {}", s.fit.label()), bold(fit_color(s.fit)))]));
     for c in &s.checks {
-        let (m, col) = if c.ok { ("✓", GREEN) } else { ("✗", RED) };
-        l.push(Line::from(vec![
-            Span::styled(format!("   {} ", m), Style::default().fg(col)),
-            Span::styled(c.text.clone(), Style::default().fg(if c.ok { FG } else { DIM })),
-        ]));
+        let (m, col) = if c.ok { ("✓", t.ink) } else { ("✗", t.red_text) };
+        l.push(Line::from(vec![Span::styled(format!("   {} ", m), fg(col)), Span::styled(c.text.clone(), fg(if c.ok { t.ink } else { t.muted }))]));
     }
 
     l.push(Line::raw(""));
     l.push(section("Links"));
     l.push(Line::raw(""));
-    l.push(kv("Call page [Enter]", o.apply_url.clone(), BLUE));
-    l.push(kv("Found on  [i]", o.info_url.clone(), BLUE));
+    l.push(kv("Call page [Enter]", o.apply_url.clone(), t.ink));
+    l.push(kv("Found on  [i]", o.info_url.clone(), t.ink));
 
     l.push(Line::raw(""));
     l.push(section("Tracker"));
     l.push(Line::raw(""));
-    let t = app.track(&o.id);
-    l.push(kv("Status [p]:", t.label().to_string(), if t == Track::None { DIM } else { YELLOW }));
+    let tr = app.track(&o.id);
+    l.push(kv("Status [p]:", tr.label().to_string(), if tr == Track::None { t.muted } else { t.red_text }));
 
     if !o.summary.is_empty() {
         l.push(Line::raw(""));
         l.push(section("Notes"));
         l.push(Line::raw(""));
-        l.push(Line::from(Span::styled(format!(" {}", o.summary), Style::default().fg(FG))));
+        l.push(Line::from(Span::styled(format!(" {}", o.summary), fg(t.ink))));
     }
     l
 }
@@ -681,6 +842,8 @@ fn run(mut term: DefaultTerminal) -> std::io::Result<()> {
     }
     loop {
         app.poll_live();
+        app.poll_web();
+        app.check_day();
         term.draw(|f| ui(f, &mut app))?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
@@ -689,8 +852,49 @@ fn run(mut term: DefaultTerminal) -> std::io::Result<()> {
         if k.kind != KeyEventKind::Press {
             continue;
         }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if app.mode == Mode::Web {
+            match k.code {
+                KeyCode::Enter => app.start_web(),
+                KeyCode::Esc => app.mode = Mode::Normal,
+                KeyCode::Backspace => {
+                    app.web_query.pop();
+                }
+                KeyCode::Char('u') if ctrl => app.web_query.clear(),
+                KeyCode::Char(c) => app.web_query.push(c),
+                _ => {}
+            }
+            continue;
+        }
+        if app.mode == Mode::WebResults {
+            let n = app.web_results.len();
+            let at = app.web_list.selected().unwrap_or(0);
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+                KeyCode::Down | KeyCode::Char('j') if n > 0 => app.web_list.select(Some((at + 1).min(n - 1))),
+                KeyCode::Up | KeyCode::Char('k') => app.web_list.select(Some(at.saturating_sub(1))),
+                KeyCode::Enter => {
+                    if let Some(u) = app.web_results.get(at).map(|o| o.apply_url.clone()) {
+                        open_url(&mut app, &u);
+                    }
+                }
+                KeyCode::Char('a') => app.add_web(),
+                KeyCode::Char('w') => app.mode = Mode::Web,
+                KeyCode::Char('o') => {
+                    let url = format!("https://www.google.com/search?q={}", live::urlencode(app.web_query.trim()));
+                    open_url(&mut app, &url);
+                }
+                _ => {}
+            }
+            continue;
+        }
         if app.mode == Mode::Search {
             match k.code {
+                // nothing in the list matches: look on the web instead
+                KeyCode::Enter if app.shown.is_empty() && !app.query.trim().is_empty() => {
+                    app.web_query = app.query.clone();
+                    app.start_web();
+                }
                 KeyCode::Enter | KeyCode::Esc => app.mode = Mode::Normal,
                 KeyCode::Backspace => {
                     app.query.pop();
@@ -758,9 +962,14 @@ fn run(mut term: DefaultTerminal) -> std::io::Result<()> {
             KeyCode::Char('u') => app.start_live(),
             KeyCode::Char('x') => app.export(),
             KeyCode::Char('w') => {
-                let q = if app.query.is_empty() { "open call sound art research".to_string() } else { app.query.clone() };
-                let url = format!("https://duckduckgo.com/?q={}", live::urlencode(&format!("{} open call OR grant OR residency 2027", q)));
-                open_url(&mut app, &url);
+                if !app.query.is_empty() {
+                    app.web_query = app.query.clone();
+                }
+                app.mode = Mode::Web;
+            }
+            KeyCode::Char('m') => {
+                let name = toggle_theme();
+                app.toast(format!("Theme: {}", name));
             }
             KeyCode::Char('e') => {
                 let d = data_dir();
@@ -800,7 +1009,8 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
-        let list: Vec<Opportunity> = items.into_values().collect();
+        // built-in entries come back only to carry a "closed" warning; they are not cached
+        let list: Vec<Opportunity> = items.into_values().filter(|o| o.confidence == "live").collect();
         live::save_cache(&list, today);
         let future = list.iter().filter(|o| parse_date(&o.deadline).map(|d| d >= today).unwrap_or(false)).count();
         let money = list.iter().filter(|o| o.amount_max > 0).count();
@@ -843,6 +1053,8 @@ fn main() -> std::io::Result<()> {
                 'o' => { app.status = (app.status + 1) % STATUSES.len(); app.refilter(); }
                 's' => { app.sort = (app.sort + 1) % SORTS.len(); app.refilter(); }
                 'f' => { app.fit = (app.fit + 1) % FITS.len(); app.refilter(); }
+                'm' => LIGHT_MODE.store(true, Ordering::Relaxed), // not saved: a snapshot changes no settings
+                '/' => app.mode = Mode::Search,
                 _ => {}
             }
         }
@@ -859,6 +1071,7 @@ fn main() -> std::io::Result<()> {
         println!("callfit {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    load_theme();
     let term = ratatui::init();
     let res = run(term);
     ratatui::restore();

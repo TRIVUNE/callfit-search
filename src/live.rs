@@ -376,6 +376,11 @@ re!(
 );
 // news about winners or past rounds, not a call
 re!(re_past, r"(?i)\bwins\b|\bwinners?\b|\bawarded to\b|\bannounced\b|\brecipients\b|gewinner|preisträger|lauréat|ganador|vincitor|congratulat|\bcongrats\b|\bopen role\b|we.re hiring|\bcareers\b|stellenangebot");
+// the call page itself says the round is over
+re!(
+    re_closed,
+    r"(?i)no longer (?:being )?accept|(?:submissions?|applications?|entries|registrations?|nominations|the call|this call)(?: (?:are|is|has|have))? (?:now )?(?:been )?closed\b|(?:call|competition|submission period|application period) (?:has )?(?:ended|closed)\b|deadline (?:has )?(?:passed|expired)|bewerbungs(?:frist|phase|zeitraum) (?:ist )?(?:abgelaufen|beendet|vorbei)|(?:ausschreibung|einreichung|bewerbung) (?:ist )?(?:beendet|abgeschlossen|geschlossen)|(?:candidatures|inscriptions) (?:sont )?(?:closes|clôturées|terminées)|appel (?:à [a-zé]+ )?(?:est )?(?:clos|clôturé|terminé)|convocatoria (?:está )?(?:cerrada|finalizada)|(?:bando|candidature) (?:è |sono )?(?:chius[oe]|scadut[oe])|inschrijving (?:is )?gesloten|zgłoszenia (?:zostały )?zamknięte"
+);
 re!(re_h1, r"(?is)<h1\b[^>]*>(.*?)</h1>");
 re!(re_meta, r#"(?is)<meta\b[^>]*>"#);
 re!(re_meta_key, r#"(?is)(?:property|name)\s*=\s*["']([^"']+)["']"#);
@@ -978,6 +983,20 @@ fn live_item(source: &str, name: String, url: &str, info: &str, snippet: String,
 
 // ---------------------------------------------------------------- warnings
 
+pub const CLOSED: &str = "Call page says submissions are closed";
+/// start of enrich's warning for a page behind JavaScript, a login or a CAPTCHA
+const UNREADABLE: &str = "Page needs JavaScript or a login";
+
+/// A search snippet that starts with its post date ("Dec 2, 2025 - ...") more than 180 days ago.
+fn old_post(snippet: &str, today: NaiveDate) -> bool {
+    dates_in(window(snippet, 0, 30)).first().map(|(_, d)| (today - *d).num_days() > 180).unwrap_or(false)
+}
+
+/// The page says the call is over and names no deadline still ahead.
+fn says_closed(text: &str, today: NaiveDate) -> bool {
+    re_closed().is_match(text) && find_deadline(text, today).map(|d| d < today).unwrap_or(true)
+}
+
 pub fn warn(o: &mut Opportunity, w: &str) {
     if !o.warnings.iter().any(|x| x == w) {
         o.warnings.push(w.to_string());
@@ -1218,7 +1237,8 @@ pub fn harvest_feed(source: &str, base: &str, body: &str, all: bool, today: Naiv
 }
 
 /// External result links of a search engine page (DuckDuckGo redirects decoded).
-pub fn harvest_search(engine: &str, page: &str, today: NaiveDate) -> Vec<Opportunity> {
+/// `need_kw`: keep only results that look like a call (crawl); off for a user's own search.
+pub fn harvest_search(engine: &str, page: &str, need_kw: bool, today: NaiveDate) -> Vec<Opportunity> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for c in re_anchor().captures_iter(page) {
@@ -1235,12 +1255,17 @@ pub fn harvest_search(engine: &str, page: &str, today: NaiveDate) -> Vec<Opportu
             continue;
         }
         let mut title = strip_tags(c.get(2).unwrap().as_str());
+        // Brave puts "Site host › path › slug" before the title: keep what follows the slug
+        if let Some(i) = title.rfind(" › ") {
+            let rest = &title[i + " › ".len()..];
+            title = clean_title(rest.split_once(' ').map(|x| x.1).unwrap_or(rest));
+        }
         truncate_chars(&mut title, 200);
         if title.chars().count() < 10 || junk_title(&title) {
             continue;
         }
         let snippet = snippet_after(page, c.get(0).unwrap().end());
-        if !(re_kw().is_match(&title) || re_kw().is_match(&url) || re_kw().is_match(&snippet)) {
+        if need_kw && (old_post(&snippet, today) || !(re_kw().is_match(&title) || re_kw().is_match(&url) || re_kw().is_match(&snippet))) {
             continue;
         }
         if !seen.insert(url_key(&url)) {
@@ -1366,7 +1391,7 @@ fn enrich(c: &mut Cand, body: &str, today: NaiveDate) {
     let o = &mut c.o;
     let text = page_text(body);
     if text.chars().count() < 250 || re_unreadable().is_match(window(&text, 0, 3000)) {
-        warn(o, "Page needs JavaScript or a login: details not read, open it");
+        warn(o, &format!("{}: details not read, open it", UNREADABLE));
     }
     if c.retitle || is_generic(&o.name) {
         // first title that says something: og:title, then <h1>, then <title>
@@ -1422,6 +1447,9 @@ fn enrich(c: &mut Cand, body: &str, today: NaiveDate) {
         }
     }
     flag(o, &text);
+    if says_closed(&text, today) {
+        warn(o, CLOSED);
+    }
     if let Some(l) = re_lang().captures(body) {
         let l = l[1].to_lowercase();
         if l != "en" {
@@ -1509,6 +1537,10 @@ enum Tag {
     Source,
     /// listing version of the item, replace its name with the page title
     Detail(Opportunity, bool),
+    /// a built-in or user entry: does its call page say "closed"?
+    Check(Opportunity),
+    /// search results about a site that blocked reading; the entry gets its topic from them
+    SiteSearch(Opportunity),
 }
 
 type Fetched = (Job, Tag, Result<(String, String), String>);
@@ -1698,7 +1730,7 @@ fn parse(job: &Job, final_url: &str, body: &str, today: NaiveDate) -> (Vec<Cand>
         How::Devpost => (harvest_devpost(body, today).into_iter().map(|o| cand(o, false, false)).collect(), vec![]),
         How::Confs => (harvest_confs(body, &job.term, today).into_iter().map(|o| cand(o, false, false)).collect(), vec![]),
         How::Eu => (harvest_eu(body, today).into_iter().map(|o| cand(o, false, false)).collect(), vec![]),
-        How::Search => (harvest_search(&job.term, body, today).into_iter().map(|o| cand(o, true, true)).collect(), vec![]),
+        How::Search => (harvest_search(&job.term, body, true, today).into_iter().map(|o| cand(o, true, true)).collect(), vec![]),
         How::Cfp => (harvest_feed(&job.source, final_url, body, true, today).into_iter().map(|o| cand(o, true, false)).collect(), vec![]),
         How::Page => {
             if is_feed(body) {
@@ -1733,6 +1765,54 @@ fn parse(job: &Job, final_url: &str, body: &str, today: NaiveDate) -> (Vec<Cand>
     }
 }
 
+/// One query typed by the user: results of the first engine that answers. Startpage first (it
+/// serves Google's results); Google itself answers bots with a CAPTCHA.
+pub fn web_search(query: &str, today: NaiveDate) -> Result<Vec<Opportunity>, String> {
+    let agent = agent();
+    let mut why = Vec::new();
+    for (name, base) in ENGINES.iter().rev() {
+        let job = Job { source: name.to_string(), url: format!("{}{}", base, urlencode(query)), how: How::Search, page: 1, term: String::new() };
+        match fetch(&agent, &job) {
+            Ok((_, body)) => {
+                let found = harvest_search(name, &body, false, today);
+                if !found.is_empty() {
+                    return Ok(found);
+                }
+                why.push(format!("{}: no results", name));
+            }
+            Err(e) => why.push(format!("{}: {}", name, e)),
+        }
+    }
+    Err(why.join(", "))
+}
+
+/// Read one search result's own page for deadline, dates and amount, like the crawl does.
+/// `retitle`: take the page's own title (a pasted link has none yet).
+pub fn read_page(o: Opportunity, retitle: bool, today: NaiveDate) -> Opportunity {
+    let job = Job { source: o.org.clone(), url: o.apply_url.clone(), how: How::Page, page: 0, term: String::new() };
+    let mut c = Cand { o, detail: true, retitle };
+    match fetch(&agent(), &job) {
+        Ok((_, body)) => enrich(&mut c, &body, today),
+        Err(why) => warn(&mut c.o, &format!("Page could not be read ({}): details are from the search result", why)),
+    }
+    c.o
+}
+
+/// An entry for a link the user pasted.
+pub fn link_entry(url: &str, today: NaiveDate) -> Opportunity {
+    let h = host(url);
+    read_page(live_item(&h, h.clone(), url, url, String::new(), today), true, today)
+}
+
+/// Engine for searches about one site; Startpage takes the most queries per run.
+const SITE_ENGINE: &str = "https://www.startpage.com/do/search?q=";
+
+/// A site that blocks reading (login, CAPTCHA, JavaScript): search the web for it instead.
+fn site_search(o: &Opportunity) -> Job {
+    let q = format!("{} {}", o.org, host(&o.apply_url));
+    Job { source: format!("Search about {}", o.org), url: format!("{}{}", SITE_ENGINE, urlencode(&q)), how: How::Search, page: 1, term: "Startpage".into() }
+}
+
 /// Run the whole crawl in a background thread; progress and items go to `tx`.
 pub fn spawn(tx: Sender<Msg>, today: NaiveDate) {
     std::thread::spawn(move || run(tx, today));
@@ -1744,13 +1824,24 @@ fn run(tx: Sender<Msg>, today: NaiveDate) {
     let agent = agent();
     let (rtx, rrx) = channel();
     let pool = Pool::start(&agent, rtx);
-    // passed deadline, or an old round
-    let passed = |o: &Opportunity| crate::model::parse_date(&o.deadline).map(|d| d < today).unwrap_or(false) || stale(&o.name, today);
+    // passed deadline, an old round, or the page says it is closed
+    let passed = |o: &Opportunity| {
+        crate::model::parse_date(&o.deadline).map(|d| d < today).unwrap_or(false) || stale(&o.name, today) || o.warnings.iter().any(|w| w == CLOSED)
+    };
 
     let jobs = first_jobs(today);
     let mut visited: HashSet<String> = jobs.iter().map(|j| url_key(&j.url)).collect();
     let (mut src_total, mut src_done, mut det_total, mut det_done) = (jobs.len(), 0, 0, 0);
     let mut outstanding = jobs.len();
+    // shortcut: the "closed" warning on a built-in entry is not saved; each live run sets it again
+    for o in crate::model::load_opportunities().0 {
+        if o.apply_url.starts_with("http") && !o.apply_url.to_lowercase().ends_with(".pdf") {
+            let j = Job { source: o.org.clone(), url: o.apply_url.clone(), how: How::Page, page: 0, term: String::new() };
+            pool.push(j, Tag::Check(o));
+            det_total += 1;
+            outstanding += 1;
+        }
+    }
     for j in jobs {
         pool.push(j, Tag::Source);
     }
@@ -1793,6 +1884,11 @@ fn run(tx: Sender<Msg>, today: NaiveDate) {
                             if passed(&c.o) {
                                 continue;
                             }
+                            if c.o.warnings.iter().any(|w| w.starts_with(UNREADABLE)) {
+                                pool.push(site_search(&c.o), Tag::SiteSearch(c.o.clone()));
+                                src_total += 1;
+                                outstanding += 1;
+                            }
                             if c.detail && det_total < MAX_DETAIL && !c.o.apply_url.to_lowercase().ends_with(".pdf") {
                                 let dj = Job { source: job.source.clone(), url: c.o.apply_url.clone(), how: How::Page, page: 0, term: String::new() };
                                 pool.push(dj, Tag::Detail(c.o.clone(), c.retitle));
@@ -1822,6 +1918,9 @@ fn run(tx: Sender<Msg>, today: NaiveDate) {
                         if job.how == How::Page && job.page == 1 && seen_url.insert(url_key(&job.url)) {
                             let mut o = live_opp(&job.source, job.source.clone(), &job.url, &job.url, String::new(), today);
                             warn(&mut o, &format!("Site could not be read ({}): open it to check for calls", why));
+                            pool.push(site_search(&o), Tag::SiteSearch(o.clone()));
+                            src_total += 1;
+                            outstanding += 1;
                             let _ = tx.send(Msg::Items(vec![o]));
                         }
                         (false, 0, why)
@@ -1850,6 +1949,50 @@ fn run(tx: Sender<Msg>, today: NaiveDate) {
                 if batch.len() + gone.len() >= 25 {
                     let _ = tx.send(Msg::Items(std::mem::take(&mut batch)));
                     let _ = tx.send(Msg::Gone(std::mem::take(&mut gone)));
+                }
+                let _ = tx.send(Msg::Progress { stage: "call pages", done: det_done, total: det_total, source: job.source, ok, found: 0, note: String::new() });
+            }
+            Tag::SiteSearch(mut o) => {
+                src_done += 1;
+                let ok = res.is_ok();
+                let mut fresh = Vec::new();
+                if let Ok((_, body)) = res {
+                    let found = harvest_search(&job.term, &body, false, today);
+                    // what the site is about, from the first snippets
+                    let topic: Vec<&str> = found.iter().take(3).map(|r| r.summary.as_str()).filter(|s| !s.is_empty()).collect();
+                    if !topic.is_empty() {
+                        o.summary = topic.join(" … ");
+                        truncate_chars(&mut o.summary, 500);
+                        for t in guess_tags(&format!("{} {}", o.name, o.summary)) {
+                            if !o.tags.contains(&t) {
+                                o.tags.push(t);
+                            }
+                        }
+                        warn(&mut o, "Topic read from search results: the site blocks automated reading");
+                        fresh.push(o);
+                    }
+                    // results that look like a call become entries of their own
+                    for r in found {
+                        let call = re_kw().is_match(&format!("{} {}", r.name, r.summary)) && !old_post(&r.summary, today);
+                        if call && !passed(&r) && seen_url.insert(url_key(&r.apply_url)) {
+                            fresh.push(r);
+                        }
+                    }
+                }
+                let found = fresh.len();
+                if found > 0 {
+                    let _ = tx.send(Msg::Items(fresh));
+                }
+                let _ = tx.send(Msg::Progress { stage: "sources", done: src_done, total: src_total, source: job.source, ok, found, note: String::new() });
+            }
+            Tag::Check(mut o) => {
+                det_done += 1;
+                let ok = res.is_ok();
+                if let Ok((_, body)) = res {
+                    if says_closed(&page_text(&body), today) {
+                        warn(&mut o, CLOSED);
+                        let _ = tx.send(Msg::Items(vec![o]));
+                    }
                 }
                 let _ = tx.send(Msg::Progress { stage: "call pages", done: det_done, total: det_total, source: job.source, ok, found: 0, note: String::new() });
             }
@@ -2010,9 +2153,16 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].apply_url, "http://www.wikicfp.com/cfp/servlet/event.showcfp?eventid=1&copyownerid=2");
         let ddg = r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fbears.org%2Fopen%2Dcall%2D2027%2F&rut=x">Open Call Sound 2027</a><a href="https://duckduckgo.com/settings">Settings and more</a>"#;
-        let v = harvest_search("DuckDuckGo", ddg, today());
+        let v = harvest_search("DuckDuckGo", ddg, true, today());
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].apply_url, "https://bears.org/open-call-2027/");
+        // a user's own search keeps results that don't look like a call
+        let plain = r#"<a class="result__a" href="https://www.airwiggles.com/">Airwiggles community</a>"#;
+        assert!(harvest_search("DuckDuckGo", plain, true, today()).is_empty());
+        assert_eq!(harvest_search("DuckDuckGo", plain, false, today()).len(), 1);
+        // Brave: breadcrumb before the title
+        let brave = r#"<a href="https://www.airwiggles.com/c/announcements/aircon26" class="l1"><div>Airwiggles airwiggles.com › c › announcements › aircon26 AirCon26: the free online audio conference | Airwiggles</div></a>"#;
+        assert_eq!(harvest_search("Brave", brave, false, today())[0].name, "AirCon26: the free online audio conference");
     }
 
     #[test]
@@ -2039,6 +2189,20 @@ Bewerbungsschluss ist der 28. Februar 2027.</p><footer>© 2026</footer></body></
         assert_eq!(c.o.amount_max, 12000);
         assert_eq!(c.o.kind, "Stipend");
         assert!(c.o.tags.contains(&"sound art".to_string()));
+    }
+
+    #[test]
+    fn closed_calls() {
+        let t = today();
+        assert!(says_closed("Unfortunately, submissions for the S+T+ARTS Prize 2026 are no longer being accepted. The deadline for submissions was March 9, 2026.", t));
+        assert!(says_closed("Die Bewerbungsfrist ist abgelaufen.", t));
+        assert!(says_closed("Submissions closed", t));
+        // a closed old round next to an open new one is not closed
+        assert!(!says_closed("Applications are closed for 2026. The 2027 call: deadline 4 March 2027.", t));
+        assert!(!says_closed("Submit your work by the deadline: 4 March 2027.", t));
+        assert!(old_post("December 2, 2025 - Apply to speak at AirCon26!", t));
+        assert!(!old_post("November 10, 2026 - Apply to speak at AirCon27!", t));
+        assert!(!old_post("Apply to speak at AirCon27 by 2 December 2027", t));
     }
 
     #[test]

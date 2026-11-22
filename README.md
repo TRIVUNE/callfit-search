@@ -1,6 +1,6 @@
 # callfit
 
-Find funding, open calls, residencies and paper calls that fit **Trivune**. A terminal app in the style of [llmfit](https://www.llmfit.org/), written in Rust.
+Find funding, open calls, residencies and paper calls that fit **Trivune**. A terminal app in the look of [trivune.com](https://trivune.com), written in Rust.
 
 callfit scores each opportunity against your profile and shows a fit level, a score breakdown, the money, the deadline and the apply link.
 
@@ -49,7 +49,7 @@ If `scoop` is not found after the install, open a new terminal.
 | `Enter` | Open the call page |
 | `i` | Open the page it was found on |
 | `p` | Track: Watching → Drafting → Submitted → Won → Rejected |
-| `/` | Search all fields; accents ignored (`foerderung` finds `Förderung`); `-word` excludes |
+| `/` | Filter the list: all fields, accents ignored (`foerderung` finds `Förderung`), `-word` excludes. If nothing matches, `Enter` searches the web |
 | `t` | Filter by type |
 | `r` | Filter by region (Berlin, DE, EU, World) |
 | `f` | Filter by fit (Eligible, Perfect+Good, All) |
@@ -57,9 +57,10 @@ If `scoop` is not found after the install, open a new terminal.
 | `s` | Sort (Score, Match, Deadline, Amount, Name) |
 | `v` | Show tracked only |
 | `u` | Live search now (also runs at start when saved results are over 24 hours old) |
-| `w` | Web search for the current query |
+| `w` | Search the web for anything not in the list. In the results: `Enter` opens one, `a` adds it to your list (saved in `opportunities.json`) |
 | `x` | Export the current list to CSV |
 | `e` | Open the data folder |
+| `m` | Switch between dark (charcoal) and light (light grey) theme |
 | `J` `K` | Scroll the detail panel |
 | `q` | Quit |
 
@@ -106,6 +107,7 @@ The data folder (`e` opens it) is `%APPDATA%\callfit` on Windows.
 - `queries.json` — extra web search queries for live mode: `["Klangkunst open call", ...]`.
 - `live.json` — saved live results.
 - `tracker.json` — your tracking status per call.
+- `theme.txt` — `dark` or `light`.
 
 Requirement keys for `has`: `open_source`, `germany_based`, `berlin_residence`, `berlin_brandenburg`, `artist_track_record`, `cofinance_10`, `finished_work`, `venue_partner`, `education_partner`, `international_partner`, `consortium`, `legal_entity`, `institution`, `startup`, `incubator`, `product_idea`, `critical_infrastructure`.
 
@@ -114,9 +116,11 @@ Requirement keys for `has`: `open_source`, `germany_based`, `berlin_residence`, 
 Every entry shows how it was checked:
 
 - **verified** — dates and amounts taken from the official page or press release.
-- **dates from yearly pattern** — next dates guessed from last year's dates. Confirm before you plan.
+- **dates guessed from last year** — the next round is not announced yet; the dates are a guess from last year's. These rank below confirmed calls.
+- **Call page says submissions are closed** — live search reads each call page; a page that says the call is over (and names no later deadline) is dropped from live results and marked on built-in entries.
 - **check on site** — no reliable date or amount found.
 - **live listing** — pulled from a listing page; eligibility not checked.
+- **added by you** — found with `w` and added with `a`.
 
 Always confirm the deadline on the official page before you apply.
 
