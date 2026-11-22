@@ -10,6 +10,9 @@
     "research software", "research", "open source", "software", "tools",
     "audiovisual", "sound art", "spatial audio", "immersive", "reverb", "machine learning",
     "audio", "music technology", "instruments", "interfaces", "computer music", "electroacoustic",
-    "workshops", "education", "installation", "art science", "media art", "digital"
+    "workshops", "education", "installation", "art science", "media art", "digital",
+    "pure mathematics", "algebra", "number theory", "combinatorics", "topology", "geometry", "dsp",
+    "acoustics", "speech", "creative coding", "game audio", "virtual reality", "synthesizer", "open hardware",
+    "plugin", "music information retrieval", "generative art", "quantum"
   ]
 }

@@ -28,11 +28,11 @@ const YELLOW: Color = Color::Rgb(0xff, 0xc7, 0x77);
 const RED: Color = Color::Rgb(0xff, 0x75, 0x7f);
 const SEL: Color = Color::Rgb(0x2f, 0x33, 0x4d);
 
-const KINDS: &[&str] = &["All", "Grant", "Prize", "Stipend", "Residency", "Fellowship", "Call for papers", "Open call", "Accelerator", "Live"];
+const KINDS: &[&str] = &["All", "Grant", "Prize", "Stipend", "Residency", "Fellowship", "Call for papers", "Open call", "Competition", "Hackathon", "Conference", "Accelerator", "Live"];
 const REGIONS: &[&str] = &["All", "Berlin", "DE", "EU", "World"];
 const FITS: &[&str] = &["Eligible", "Perfect+Good", "All"];
-const STATUSES: &[&str] = &["All", "Open now", "Upcoming", "Closed"];
-const SORTS: &[&str] = &["Score", "Deadline", "Amount", "Name"];
+const STATUSES: &[&str] = &["All", "Open now", "Upcoming"];
+const SORTS: &[&str] = &["Score", "Match", "Deadline", "Amount", "Name"];
 const VIEWS: &[&str] = &["All", "Tracked"];
 
 #[derive(PartialEq)]
@@ -69,7 +69,10 @@ impl App {
     fn new() -> Self {
         let today = Local::now().date_naive();
         let profile = load_profile();
-        let (opps, user_entries) = load_opportunities();
+        let (mut opps, user_entries) = load_opportunities();
+        let cached = live::load_cache(today);
+        let live_count = cached.len();
+        opps.extend(cached);
         let all = opps.iter().map(|o| score(o, &profile, today)).collect();
         let mut app = App {
             today,
@@ -87,8 +90,8 @@ impl App {
             view: 0,
             tracker: load_tracker(),
             live_rx: None,
-            live_status: "press u".into(),
-            live_count: 0,
+            live_status: if live_count > 0 { format!("{} saved, press u", live_count) } else { "press u".into() },
+            live_count,
             toast: None,
             detail_scroll: 0,
             user_entries,
@@ -104,13 +107,17 @@ impl App {
 
     fn refilter(&mut self) {
         let keep_id = self.current().map(|s| s.opp.id.clone());
-        let q = self.query.to_lowercase();
+        let q = self.query.clone();
         let mut idx: Vec<usize> = (0..self.all.len())
             .filter(|&i| {
                 let s = &self.all[i];
                 let o = &s.opp;
-                if KINDS[self.kind] != "All" && o.kind != KINDS[self.kind] {
-                    return false;
+                match KINDS[self.kind] {
+                    "All" => {}
+                    "Live" if o.confidence != "live" => return false,
+                    "Live" => {}
+                    k if o.kind != k => return false,
+                    _ => {}
                 }
                 if REGIONS[self.region] != "All" && o.scope != REGIONS[self.region] {
                     return false;
@@ -123,20 +130,24 @@ impl App {
                 match STATUSES[self.status] {
                     "Open now" if !matches!(s.status, Status::Open | Status::Rolling) => return false,
                     "Upcoming" if s.status != Status::Upcoming => return false,
-                    "Closed" if s.status != Status::Closed => return false,
+                    _ if s.status == Status::Closed => return false, // passed deadlines are never shown
                     _ => {}
                 }
                 if VIEWS[self.view] == "Tracked" && self.track(&o.id) == Track::None {
                     return false;
                 }
                 if !q.is_empty() {
-                    let hay = format!(
-                        "{} {} {} {} {} {} {}",
-                        o.name, o.org, o.kind, o.city, o.country, o.summary, o.tags.join(" ")
-                    )
-                    .to_lowercase();
-                    if !q.split_whitespace().all(|w| hay.contains(w)) {
-                        return false;
+                    // every word must match (accent-insensitive); "-word" excludes
+                    let hay = live::fold(&format!(
+                        "{} {} {} {} {} {} {} {} {} {} {}",
+                        o.name, o.org, o.kind, o.city, o.country, o.scope, o.summary, o.tags.join(" "),
+                        o.amount_note, o.cadence, o.apply_url
+                    ));
+                    for w in q.split_whitespace() {
+                        let (neg, w) = match w.strip_prefix('-') { Some(x) if !x.is_empty() => (true, x), _ => (false, w) };
+                        if hay.contains(&live::fold(w)) == neg {
+                            return false;
+                        }
                     }
                 }
                 true
@@ -162,6 +173,7 @@ impl App {
                 let y = all[b].opp.amount_max.max(all[b].opp.amount_min);
                 y.cmp(&x)
             }),
+            "Match" => idx.sort_by(|&a, &b| all[b].match10.cmp(&all[a].match10).then(all[b].overall.partial_cmp(&all[a].overall).unwrap())),
             "Name" => idx.sort_by(|&a, &b| all[a].opp.name.to_lowercase().cmp(&all[b].opp.name.to_lowercase())),
             _ => idx.sort_by(|&a, &b| all[b].overall.partial_cmp(&all[a].overall).unwrap()),
         }
@@ -198,10 +210,7 @@ impl App {
         live::spawn(tx, self.today);
         self.live_rx = Some(rx);
         self.live_status = "loading…".into();
-        // drop old live rows
-        self.all.retain(|s| s.opp.confidence != "live");
-        self.live_count = 0;
-        self.refilter();
+        // old live rows stay until this run replaces them
     }
 
     fn poll_live(&mut self) {
@@ -212,18 +221,32 @@ impl App {
                 match m {
                     live::Msg::Items(items) => {
                         for o in items {
-                            if self.all.iter().any(|s| s.opp.apply_url == o.apply_url) {
+                            changed = true;
+                            if let Some(s) = self.all.iter_mut().find(|s| s.opp.id == o.id) {
+                                *s = score(&o, &self.profile, self.today);
+                                continue;
+                            }
+                            // a built-in entry with the same link wins over the live copy
+                            if self.all.iter().any(|s| s.opp.confidence != "live" && !s.opp.apply_url.is_empty() && s.opp.apply_url == o.apply_url) {
                                 continue;
                             }
                             self.all.push(score(&o, &self.profile, self.today));
                             self.live_count += 1;
-                            changed = true;
                         }
                     }
-                    live::Msg::Progress { done, total, .. } => {
-                        self.live_status = format!("loading {}/{}", done, total);
+                    live::Msg::Gone(ids) => {
+                        let before = self.all.len();
+                        self.all.retain(|s| !ids.contains(&s.opp.id));
+                        self.live_count -= before - self.all.len();
+                        changed = true;
+                    }
+                    live::Msg::Progress { stage, done, total, .. } => {
+                        self.live_status = format!("{} {}/{} · {} found", stage, done, total, self.live_count);
                     }
                     live::Msg::Done { failed } => {
+                        let live: Vec<Opportunity> = self.all.iter().filter(|s| s.opp.confidence == "live").map(|s| s.opp.clone()).collect();
+                        self.live_count = live.len();
+                        live::save_cache(&live, self.today);
                         self.live_status = if failed.is_empty() {
                             format!("{} live", self.live_count)
                         } else {
@@ -246,13 +269,14 @@ impl App {
         let name = format!("callfit_{}.csv", Local::now().format("%Y%m%d_%H%M"));
         let path = std::env::current_dir().unwrap_or_default().join(&name);
         let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-        let mut out = String::from("fit,score,name,org,type,where,amount,deadline,status,tracker,apply_url,info_url\n");
+        let mut out = String::from("fit,match,score,name,org,type,where,amount,deadline,event,status,tracker,apply_url,info_url\n");
         for &i in &self.shown {
             let s = &self.all[i];
             let o = &s.opp;
             out.push_str(&format!(
-                "{},{:.0},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{:.0},{},{},{},{},{},{},{},{},{},{},{}\n",
                 s.fit.label(),
+                s.match10,
                 s.overall,
                 esc(&o.name),
                 esc(&o.org),
@@ -260,6 +284,7 @@ impl App {
                 esc(&where_text(o)),
                 esc(&fmt_amount(o)),
                 o.deadline.clone().unwrap_or_default(),
+                esc(&o.event),
                 s.status.label(),
                 self.track(&o.id).label(),
                 esc(&o.apply_url),
@@ -290,6 +315,15 @@ fn short_kind(k: &str) -> String {
         "Call for papers" => "Papers".into(),
         "Accelerator" => "Founders".into(),
         other => other.into(),
+    }
+}
+
+fn match_color(m: u8) -> Color {
+    match m {
+        8..=10 => GREEN,
+        5..=7 => BLUE,
+        2..=4 => YELLOW,
+        _ => DIM,
     }
 }
 
@@ -413,7 +447,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(57), Constraint::Percentage(43)])
         .split(rows[2]);
 
-    let header_row = Row::new(["", "Opportunity", "Type", "Amount", "Deadline", "Left", "Where", "Score"])
+    let header_row = Row::new(["", "Opportunity", "Type", "Amount", "Deadline", "Left", "Where", "Match", "Score"])
         .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
     let rows_v: Vec<Row> = app
         .shown
@@ -426,12 +460,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             let mark = if tr != Track::None { "★" } else { "●" };
             Row::new(vec![
                 Cell::from(Span::styled(mark, Style::default().fg(fit_color(s.fit)))),
-                Cell::from(Span::styled(o.name.clone(), Style::default().fg(FG))),
+                Cell::from(Span::styled(if o.warnings.is_empty() { o.name.clone() } else { format!("⚠ {}", o.name) }, Style::default().fg(FG))),
                 Cell::from(Span::styled(short_kind(&o.kind), Style::default().fg(CYAN))),
                 Cell::from(Span::styled(fmt_amount(o), Style::default().fg(YELLOW))),
                 Cell::from(Span::styled(dl, Style::default().fg(dc))),
                 Cell::from(Span::styled(left, Style::default().fg(dc))),
                 Cell::from(Span::styled(where_text(o), Style::default().fg(DIM))),
+                Cell::from(Span::styled(format!("{:>2}/10", s.match10), Style::default().fg(match_color(s.match10)))),
                 Cell::from(Span::styled(format!("{:.0}", s.overall), Style::default().fg(fit_color(s.fit)))),
             ])
         })
@@ -447,6 +482,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Length(11),
             Constraint::Length(10),
             Constraint::Length(12),
+            Constraint::Length(5),
             Constraint::Length(5),
         ],
     )
@@ -544,7 +580,10 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
         ),
         _ => dl,
     };
-    l.push(kv("Deadline:", deadline_txt, dc));
+    l.push(kv("Deadline:", format!("{}  (apply / submit)", deadline_txt), dc));
+    if !o.event.is_empty() {
+        l.push(kv("Event:", o.event.clone(), FG));
+    }
     if let Some(op) = &o.opens {
         l.push(kv("Opens:", op.clone(), FG));
     }
@@ -561,6 +600,9 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
         _ => ("check on site", RED),
     };
     l.push(kv("Data:", format!("{} · checked {}", conf.0, o.checked), conf.1));
+    for w in &o.warnings {
+        l.push(kv("⚠", w.clone(), RED));
+    }
 
     l.push(Line::raw(""));
     l.push(section("Score Breakdown"));
@@ -579,9 +621,11 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
         Span::styled("Timing: ", Style::default().fg(DIM)),
         Span::styled(format!("{}", s.timing), Style::default().fg(FG)),
     ]));
-    if !s.matched.is_empty() {
-        l.push(kv("Matches you:", s.matched.join(", "), GREEN));
-    }
+    l.push(kv(
+        "Match:",
+        if s.matched.is_empty() { format!("{}/10 (no overlap with your interests)", s.match10) } else { format!("{}/10 ({})", s.match10, s.matched.join(", ")) },
+        match_color(s.match10),
+    ));
 
     l.push(Line::raw(""));
     l.push(section("Trivune Fit"));
@@ -601,8 +645,8 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
     l.push(Line::raw(""));
     l.push(section("Links"));
     l.push(Line::raw(""));
-    l.push(kv("Apply [Enter]", o.apply_url.clone(), BLUE));
-    l.push(kv("Info  [i]", o.info_url.clone(), BLUE));
+    l.push(kv("Call page [Enter]", o.apply_url.clone(), BLUE));
+    l.push(kv("Found on  [i]", o.info_url.clone(), BLUE));
 
     l.push(Line::raw(""));
     l.push(section("Tracker"));
@@ -632,6 +676,9 @@ fn open_url(app: &mut App, url: &str) {
 
 fn run(mut term: DefaultTerminal) -> std::io::Result<()> {
     let mut app = App::new();
+    if live::cache_stale() {
+        app.start_live();
+    }
     loop {
         app.poll_live();
         term.draw(|f| ui(f, &mut app))?;
@@ -712,7 +759,7 @@ fn run(mut term: DefaultTerminal) -> std::io::Result<()> {
             KeyCode::Char('x') => app.export(),
             KeyCode::Char('w') => {
                 let q = if app.query.is_empty() { "open call sound art research".to_string() } else { app.query.clone() };
-                let url = format!("https://duckduckgo.com/?q={}", urlencode(&format!("{} open call OR grant OR residency 2027", q)));
+                let url = format!("https://duckduckgo.com/?q={}", live::urlencode(&format!("{} open call OR grant OR residency 2027", q)));
                 open_url(&mut app, &url);
             }
             KeyCode::Char('e') => {
@@ -725,25 +772,62 @@ fn run(mut term: DefaultTerminal) -> std::io::Result<()> {
     }
 }
 
-fn urlencode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            b' ' => "+".into(),
-            _ => format!("%{:02X}", b),
-        })
-        .collect()
-}
-
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--scan") {
+        // headless live search: report per source, save results for the app
+        let today = Local::now().date_naive();
+        let t0 = std::time::Instant::now();
+        let (tx, rx) = channel();
+        live::spawn(tx, today);
+        let mut items: HashMap<String, Opportunity> = HashMap::new();
+        for m in rx {
+            match m {
+                live::Msg::Items(v) => items.extend(v.into_iter().map(|o| (o.id.clone(), o))),
+                live::Msg::Gone(ids) => ids.iter().for_each(|id| {
+                    items.remove(id);
+                }),
+                live::Msg::Progress { stage, done, total, source, ok, found, note } => {
+                    if stage != "call pages" {
+                        println!("{:<10} {:>4}/{:<4} {} {:>3}  {}  {}", stage, done, total, if ok { "ok  " } else { "FAIL" }, found, source, note);
+                    } else if done % 200 == 0 || done == total {
+                        println!("call pages {}/{}", done, total);
+                    }
+                }
+                live::Msg::Done { failed } => {
+                    println!("{} sources failed: {}", failed.len(), failed.join(", "));
+                    break;
+                }
+            }
+        }
+        let list: Vec<Opportunity> = items.into_values().collect();
+        live::save_cache(&list, today);
+        let future = list.iter().filter(|o| parse_date(&o.deadline).map(|d| d >= today).unwrap_or(false)).count();
+        let money = list.iter().filter(|o| o.amount_max > 0).count();
+        let mut kinds: HashMap<&str, usize> = HashMap::new();
+        for o in &list {
+            *kinds.entry(o.kind.as_str()).or_default() += 1;
+        }
+        let mut kinds: Vec<_> = kinds.into_iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1));
+        println!(
+            "\n{} results in {:.0}s: {} with an upcoming deadline, {} with an amount.",
+            list.len(),
+            t0.elapsed().as_secs_f32(),
+            future,
+            money
+        );
+        println!("{}", kinds.iter().map(|(k, n)| format!("{} {}", n, k)).collect::<Vec<_>>().join(", "));
+        println!("Saved to {}. Run callfit to browse them.", data_dir().join("live.json").display());
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--list") {
         // plain output, handy for scripts
         let app = App::new();
         for &i in &app.shown {
             let s = &app.all[i];
             let (dl, left, _) = deadline_cell(s);
-            println!("{:>5.1}  {:<12} {:<52} {:<10} {:<12} {}", s.overall, s.fit.label(), s.opp.name, fmt_amount(&s.opp), dl, left);
+            println!("{:>5.1}  {:>2}/10  {:<12} {:<11} {:<60} {:<10} {:<12} {}", s.overall, s.match10, s.fit.label(), s.opp.kind, s.opp.name, fmt_amount(&s.opp), dl, left);
         }
         return Ok(());
     }

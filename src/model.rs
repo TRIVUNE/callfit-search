@@ -33,6 +33,9 @@ pub struct Opportunity {
     pub opens: Option<String>,
     #[serde(default)]
     pub deadline: Option<String>,
+    /// When the event itself happens (festival, conference, exhibition), e.g. "2027-07-02 – 2027-07-04".
+    #[serde(default)]
+    pub event: String,
     #[serde(default)]
     pub rolling: bool,
     #[serde(default)]
@@ -56,6 +59,9 @@ pub struct Opportunity {
     /// verified | pattern | verify | live
     #[serde(default)]
     pub confidence: String,
+    /// Shown in red: entry fee, region limit, pay-to-publish signals, unreadable page.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 fn eur() -> String {
@@ -133,6 +139,8 @@ pub struct Scored {
     pub days_to_open: Option<i64>,
     pub eligibility: u32,
     pub relevance: u32,
+    /// 0-10: how close the topic is to the profile's interests
+    pub match10: u8,
     pub money: u32,
     pub timing: u32,
     pub overall: f32,
@@ -213,16 +221,31 @@ pub fn score(o: &Opportunity, p: &Profile, today: NaiveDate) -> Scored {
     }
     let eligibility = if hard_fail { 0 } else { 100u32.saturating_sub(missing * 35) };
 
-    // --- relevance
-    let interests: Vec<String> = p.interests.iter().map(|s| norm(s)).collect();
+    // --- relevance / match 0-10. Half points: an interest in the name = 4, in summary or tags = 2;
+    // broad interests (research, software...) count half. 12 half points = 10/10.
+    const BROAD: &[&str] = &["digital", "research", "software", "tools", "education", "workshops", "interfaces", "instruments", "plugin", "music", "immersive"];
+    let fold = crate::live::fold;
+    let name_f = fold(&o.name);
+    let rest_f = fold(&format!("{} {}", o.summary, o.tags.join(" ")));
+    let mut points = 0u32;
     let mut matched = Vec::new();
-    for t in &o.tags {
-        let tl = norm(t);
-        if interests.iter().any(|i| i == &tl || tl.contains(i.as_str()) || i.contains(tl.as_str())) {
-            matched.push(t.clone());
+    for i in &p.interests {
+        let f = fold(i);
+        if f.is_empty() {
+            continue;
         }
+        let w = if BROAD.contains(&f.as_str()) { 1 } else { 2 };
+        if name_f.contains(&f) {
+            points += 2 * w;
+        } else if rest_f.contains(&f) {
+            points += w;
+        } else {
+            continue;
+        }
+        matched.push(i.clone());
     }
-    let relevance = if o.tags.is_empty() { 40 } else { (matched.len() as u32 * 25).min(100) };
+    let match10 = (points * 10 / 12).min(10) as u8;
+    let relevance = match10 as u32 * 10;
 
     // --- money (rough EUR)
     let amt = o.amount_max.max(o.amount_min) as f64;
@@ -294,6 +317,7 @@ pub fn score(o: &Opportunity, p: &Profile, today: NaiveDate) -> Scored {
         days_to_open,
         eligibility,
         relevance,
+        match10,
         money,
         timing,
         overall,
@@ -309,6 +333,7 @@ pub fn scope_text(s: &str) -> &str {
         "EU" => "EU-based applicants",
         "DE" => "Germany-based applicants",
         "Berlin" => "Berlin-based applicants",
+        "Restricted" => "a region that excludes you",
         other => other,
     }
 }
