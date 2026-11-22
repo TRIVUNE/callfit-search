@@ -14,6 +14,33 @@ callfit scores each opportunity against your profile and shows a fit level, a sc
 
 Use Windows Terminal for the best look.
 
+### Install with Scoop (Windows)
+
+1. If you don't have Scoop yet, open PowerShell (not as admin) and run:
+
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+   Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+   ```
+
+2. Scoop needs Git to add a bucket. If `git --version` fails, run `scoop install git`.
+3. Add the Trivune bucket and install callfit:
+
+   ```powershell
+   scoop bucket add trivune https://github.com/TRIVUNE/scoop-bucket
+   scoop install callfit
+   ```
+
+4. Open a new terminal and run `callfit`.
+
+| Task | Command |
+|---|---|
+| Update | `scoop update callfit` |
+| Remove | `scoop uninstall callfit` |
+| Check the version | `callfit --version` |
+
+If `scoop` is not found after the install, open a new terminal.
+
 ## Keys
 
 | Key | Action |
@@ -95,6 +122,16 @@ Always confirm the deadline on the official page before you apply.
 
 ## Release (maintainers)
 
-1. Push a tag: `git tag v0.1.0 && git push --tags`. GitHub Actions builds Windows, macOS and Linux binaries and attaches them to the release.
-2. Download `callfit.json` from the release. It already has the version, URL and hash. Put it in the root of the `TRIVUNE/scoop-bucket` repo.
-3. Later releases update through Scoop's `autoupdate`.
+First release:
+
+1. Make `TRIVUNE/callfit-search` public. Scoop can't download from a private repo.
+2. Push the code: `git push -u origin main`.
+3. Push a tag: `git tag v0.1.0`, then `git push origin v0.1.0`. GitHub Actions runs the tests, builds Windows, macOS and Linux binaries, and attaches them to the release.
+4. Create a public repo `TRIVUNE/scoop-bucket`.
+5. Download `callfit.json` from the release. It already has the version, URL and hash. Put it in the root of `TRIVUNE/scoop-bucket` and push.
+6. Test it: `scoop bucket add trivune https://github.com/TRIVUNE/scoop-bucket`, then `scoop install callfit`.
+
+Later releases:
+
+1. Raise `version` in `Cargo.toml`, commit, and push a new tag (`v0.1.1`).
+2. Replace `callfit.json` in the bucket with the one from the new release, and push.
