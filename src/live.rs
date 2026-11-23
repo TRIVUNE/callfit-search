@@ -345,7 +345,9 @@ macro_rules! re {
 
 re!(re_anchor, r#"(?is)<a\b([^>]*)>(.*?)</a>"#);
 re!(re_href, r#"(?is)\bhref\s*=\s*["']([^"']+)["']"#);
-re!(re_strip, r"(?is)<!--.*?-->|<script\b.*?</script>|<style\b.*?</style>|<noscript\b.*?</noscript>|<svg\b.*?</svg>|<[^>]+>");
+// a quoted attribute may hold ">" (Alpine/Vue: x-trap="a && b > c"); "a < b" is not a tag;
+// a snippet window can end inside a tag ("<a href=...")
+re!(re_strip, r#"(?is)<!--.*?-->|<script\b.*?</script>|<style\b.*?</style>|<noscript\b.*?</noscript>|<svg\b.*?</svg>|<[a-zA-Z/!?](?:[^>"']|"[^"]*"|'[^']*')*>|<[a-zA-Z/!?][^<>]*$"#);
 re!(re_chrome, r"(?is)<nav\b.*?</nav>|<footer\b.*?</footer>");
 re!(re_entity, r"&(#[xX][0-9a-fA-F]+|#\d+|[a-zA-Z]+\d*);");
 re!(
@@ -376,7 +378,20 @@ re!(
     r"(?i)^(?:explore|view|see|show|browse|discover|find|search|load|all)\b.{0,30}\b(?:calls|competitions|opportunities|events|hackathons|grants|jams|challenges|listings|results|programmes|programs|funding)\b|competition search|^apply for funding$|^(?:more|next|previous)\b"
 );
 // news about winners or past rounds, not a call
-re!(re_past, r"(?i)\bwins\b|\bwinners?\b|\bawarded to\b|\bannounced\b|\brecipients\b|gewinner|preisträger|lauréat|ganador|vincitor|congratulat|\bcongrats\b|\bopen role\b|we.re hiring|\bcareers\b|stellenangebot");
+re!(re_past, r"(?i)\bwins\b|\bwinners?\b|\brecipients\b|gewinner|preisträger|lauréat|ganador|vincitor|congratulat|\bcongrats\b|\bopen role\b|we.re hiring|\bcareers\b|stellenangebot|stellenausschreibung|^finished\b|\bawarded\b|\bprojects? receives?\b|\bnew projects\b|^read (?:the )?article|^past \w+");
+re!(re_stats, r"^\d+(?:\.\d+)?k?\s+\d+\s+\d+\s+");
+re!(re_title_attr, r#"(?is)\btitle\s*=\s*(?:"([^"]+)"|'([^']+)')"#);
+re!(re_more_prefix, r"(?i)^(?:read more|more details|more info|learn more|details|mehr|weiterlesen)\s*(?:about|on|for|zu|über|:)?\s*");
+// pages that are not calls: concert listings ("Di., 03.11.2026 19:30 Uhr"), study admission,
+// report buttons, image credits, policy pages
+re!(
+    re_not_call,
+    r"(?i)^(?:mo|di|mi|do|fr|sa|so|mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+\d{1,2}[./]\s*\d{1,2}[./]|studienvoraussetzung|studieng(?:ä|ae)nge?\b|studienangebot|voraussetzungen für ein studium|studienwahl|immatrikulation|eignungspr(?:ü|ue)fung|aufnahmepr(?:ü|ue)fung|^vor der bewerbung|\badmissions?\b|\bundergraduate\b|ergebnisse laden|^load more\b|^report this\b|^your favou?rites\b|^©|^code of conduct\b|^jury statements?\b"
+);
+re!(re_count_end, r"\s\(?\d{1,3}\)?$");
+// announcements are news, unless they announce a call ("Announcing the Open Call 2027")
+re!(re_announce, r"(?i)\bannounc(?:ed|es|ing|ements?)\b");
+re!(re_call_phrase, r"(?i)\bopen calls?\b|\bcalls? for\b|\bapplications? (?:are )?open\b|ausschreibung|appel à");
 // the call page itself says the round is over
 re!(
     re_closed,
@@ -427,6 +442,9 @@ fn decode_entities(s: &str) -> String {
     re_entity()
         .replace_all(s, |c: &regex::Captures| {
             let e = &c[1];
+            if e == "shy" {
+                return String::new(); // soft hyphen: "Künstlerinnen&shy;förderung"
+            }
             let ch = if let Some(h) = e.strip_prefix("#x").or_else(|| e.strip_prefix("#X")) {
                 u32::from_str_radix(h, 16).ok().and_then(char::from_u32)
             } else if let Some(d) = e.strip_prefix('#') {
@@ -616,10 +634,23 @@ fn clean_title(t: &str) -> String {
     t
 }
 
-/// Navigation links, winner news, and titles that are mostly numbers ("58.2k 177 29 ...").
+/// Navigation links, winner news, titles that are mostly numbers ("58.2k 177 29 ..."),
+/// bare URLs, and person names or menu links ("Fabian Brinkmann": 2-3 capitalized words,
+/// no call word, no topic).
 fn junk_title(title: &str) -> bool {
-    let digits = title.chars().filter(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '(' | ')')).count();
-    re_nav_title().is_match(title.trim()) || re_past().is_match(title) || digits * 10 > title.chars().count() * 3
+    let t = title.trim();
+    let digits = t.chars().filter(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '(' | ')')).count();
+    let words: Vec<&str> = t.split_whitespace().collect();
+    let name_like = (2..=3).contains(&words.len())
+        && words.iter().all(|w| {
+            let mut c = w.chars();
+            c.next().is_some_and(char::is_uppercase) && c.all(|x| x.is_lowercase() || x == '-')
+        })
+        && guess_kind(t, "").is_none()
+        && guess_tags(t).is_empty();
+    let news = re_past().is_match(t) || re_announce().is_match(t) && !re_call_phrase().is_match(t);
+    let facet = re_count_end().is_match(t) && guess_kind(t, "").is_none();
+    re_nav_title().is_match(t) || news || re_not_call().is_match(t) || facet || digits * 10 > t.chars().count() * 3 || t.contains("://") || t.starts_with("www.") || name_like
 }
 
 re!(re_year, r"\b(20\d\d)\b");
@@ -897,7 +928,7 @@ fn guess_tags(text: &str) -> Vec<String> {
         ("software", &["software", "programming"]),
         ("tools", &["plugin", "plug-in", " vst", "toolkit"]),
         ("instruments", &["musical instrument", "instrument building", "instrument design", "synthesizer", "eurorack", "modular synth"]),
-        ("interfaces", &["musical interface", "musical expression", "nime", "midi controller", "human computer interaction", " hci "]),
+        ("interfaces", &["musical interface", "musical expression", " nime","midi controller", "human computer interaction", " hci "]),
         ("game audio", &["game audio", "game sound", "wwise", "fmod", "game jam", "gamejam"]),
         ("creative coding", &["creative coding", "openframeworks", "processing.org", "generative"]),
         ("open hardware", &["open hardware", "open-source hardware", "arduino", "eurorack", "diy electronics"]),
@@ -931,12 +962,30 @@ fn guess_kind(name: &str, text: &str) -> Option<String> {
     truncate_chars(&mut t, 2500);
     for hay in [&n, &t] {
         for (kind, words) in rules {
-            if words.iter().any(|w| hay.contains(w)) {
+            if words.iter().any(|w| kind_word(hay, w)) {
                 return Some(kind.to_string());
             }
         }
     }
     None
+}
+
+/// Stems that also count inside German compounds ("Projektförderung", "Kunstpreis").
+const COMPOUND: &[&str] = &["forder", "preis", "wettbewerb", "stipendi", "residenz", "ausschreibung", "zuschuss"];
+/// Short words that are only themselves: "beca" is not "because", "fund" not "fundamental".
+const WHOLE: &[&str] = &["beca", "fund", "premi", "bando", "bolsa", "beurs", "cfp"];
+
+/// A kind word at a word start; compound stems anywhere ("erforderlich" = required is not
+/// funding); whole words also at a word end, plural allowed.
+fn kind_word(hay: &str, w: &str) -> bool {
+    hay.match_indices(w).any(|(i, _)| {
+        let before = &hay[..i];
+        if COMPOUND.contains(&w) {
+            return !(w == "forder" && before.ends_with("er"));
+        }
+        let after = &hay[i + w.len()..];
+        !before.ends_with(char::is_alphanumeric) && (!WHOLE.contains(&w) || !after.strip_prefix('s').unwrap_or(after).starts_with(char::is_alphanumeric))
+    })
 }
 
 fn live_opp(source: &str, name: String, url: &str, info: &str, snippet: String, today: NaiveDate) -> Opportunity {
@@ -1123,6 +1172,16 @@ fn snippet_after(page: &str, end: usize) -> String {
     s
 }
 
+/// Card text before a button at the card's end, back to the card start (<li>, <article>, <tr>).
+fn snippet_before(page: &str, start: usize) -> String {
+    let w = window(page, start.saturating_sub(1500), start);
+    // no card start: the text before may belong to other links (a menu), so use none
+    let Some(from) = ["<li", "<article", "<tr"].iter().filter_map(|t| w.rfind(t)).max() else { return String::new() };
+    let mut s = strip_tags(&w[from..]);
+    truncate_chars(&mut s, 300);
+    s
+}
+
 /// Opportunity links on an HTML listing page. Same-site links pass on a keyword in the title,
 /// path or nearby text; links to other sites need the keyword in the title or path.
 pub fn harvest(source: &str, base: &str, page: &str, today: NaiveDate) -> Vec<Opportunity> {
@@ -1135,7 +1194,16 @@ pub fn harvest(source: &str, base: &str, page: &str, today: NaiveDate) -> Vec<Op
         if re_skip().is_match(&href) {
             continue;
         }
-        let title = strip_tags(c.get(2).unwrap().as_str());
+        // hackaday prefixes views, likes and followers: "12.4k 120 4 Home is Where the Hacks Are"
+        let mut title = re_stats().replace(&strip_tags(c.get(2).unwrap().as_str()), "").into_owned();
+        // a "More details" button names its call in the title attribute: "Read more about X"
+        let mut button = false;
+        if is_generic(&title) {
+            if let Some(t) = re_title_attr().captures(c.get(1).unwrap().as_str()).and_then(|a| a.get(1).or(a.get(2))) {
+                title = re_more_prefix().replace(&strip_tags(&decode_entities(t.as_str())), "").into_owned();
+                button = true;
+            }
+        }
         let tl = title.chars().count();
         if !(12..=200).contains(&tl) || junk_title(&title) {
             continue;
@@ -1149,7 +1217,10 @@ pub fn harvest(source: &str, base: &str, page: &str, today: NaiveDate) -> Vec<Op
         if path.trim_matches('/').is_empty() || url_key(&url) == url_key(base) {
             continue;
         }
-        let snippet = snippet_after(page, c.get(0).unwrap().end());
+        let mut snippet = snippet_after(page, c.get(0).unwrap().end());
+        if button && snippet.chars().count() < 40 {
+            snippet = snippet_before(page, c.get(0).unwrap().start());
+        }
         let strong = re_kw().is_match(&title) || re_kw().is_match(path);
         let ok = if h == base_host { strong || re_kw().is_match(&snippet) } else { strong && !re_engine_host().is_match(&h) };
         if !ok || !seen.insert(url_key(&url)) {
@@ -1774,20 +1845,24 @@ fn parse(job: &Job, final_url: &str, body: &str, today: NaiveDate) -> (Vec<Cand>
     }
 }
 
-/// Passed deadline, an old round, or the page says it is closed.
+/// Passed deadline, an old round (by title, or by URL when no deadline is known:
+/// ".../contest/191511-cyberdeck-2023"), or the page says it is closed.
 fn is_passed(o: &Opportunity, today: NaiveDate) -> bool {
-    crate::model::parse_date(&o.deadline).map(|d| d < today).unwrap_or(false) || stale(&o.name, today) || o.warnings.iter().any(|w| w == CLOSED)
+    let path = o.apply_url.split('?').next().unwrap_or("");
+    let old_url = o.deadline.is_none() && stale(path, today);
+    crate::model::parse_date(&o.deadline).map(|d| d < today).unwrap_or(false) || stale(&o.name, today) || old_url || o.warnings.iter().any(|w| w == CLOSED)
 }
 
 /// One query typed by the user: every engine at once (Startpage serves Google's results; Google
 /// itself answers bots with a CAPTCHA), merged in rank order. Drops duplicates and pages in
 /// `known` (url keys of entries already in the list).
 pub fn web_search(query: &str, known: &HashSet<String>, today: NaiveDate) -> Result<Vec<Opportunity>, String> {
+    let query = web_query(query, today);
     let asks: Vec<_> = ENGINES
         .iter()
         .rev()
         .map(|&(name, base)| {
-            let job = Job { source: name.to_string(), url: format!("{}{}", base, urlencode(query)), how: How::Search, page: 1, term: String::new() };
+            let job = Job { source: name.to_string(), url: format!("{}{}", base, urlencode(&query)), how: How::Search, page: 1, term: String::new() };
             std::thread::spawn(move || match fetch(&agent(), &job) {
                 Ok((_, body)) => {
                     let v = harvest_search(name, &body, false, today);
@@ -1805,20 +1880,39 @@ pub fn web_search(query: &str, known: &HashSet<String>, today: NaiveDate) -> Res
             Err(_) => why.push("a search engine crashed".to_string()),
         }
     }
-    // each engine's 1st result, then each one's 2nd...
-    let mut seen = known.clone();
-    let mut out = vec![];
-    for i in 0..lists.iter().map(Vec::len).max().unwrap_or(0) {
-        for o in lists.iter().filter_map(|l| l.get(i)) {
-            if seen.insert(url_key(&o.apply_url)) {
-                out.push(o.clone());
+    // rank: found by more engines and higher up first; call words and a deadline in the snippet count extra
+    let mut at: HashMap<String, usize> = HashMap::new();
+    let mut ranked: Vec<(u32, Opportunity)> = vec![];
+    for l in &lists {
+        for (rank, o) in l.iter().enumerate() {
+            let k = url_key(&o.apply_url);
+            if known.contains(&k) || old_post(&o.summary, today) {
+                continue;
             }
+            let i = *at.entry(k).or_insert_with(|| {
+                let call = re_kw().is_match(&o.name) || re_kw().is_match(&o.apply_url) || re_kw().is_match(&o.summary);
+                ranked.push((15 * call as u32 + 5 * o.deadline.is_some() as u32, o.clone()));
+                ranked.len() - 1
+            });
+            ranked[i].0 += 10u32.saturating_sub(rank as u32).max(1);
         }
     }
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.0)); // stable: ties keep the engines' order
+    let out: Vec<Opportunity> = ranked.into_iter().map(|r| r.1).collect();
     if out.is_empty() {
         return Err(if lists.is_empty() { why.join(", ") } else { "every result is already in your list".to_string() });
     }
     Ok(out)
+}
+
+/// A search with no call word ("spatial audio") asks for open calls, so engines return calls
+/// instead of articles and shops. The year is 90 days ahead: in autumn, next year's calls are open.
+fn web_query(q: &str, today: NaiveDate) -> String {
+    if re_kw().is_match(q) || guess_kind(q, "").is_some() {
+        q.to_string()
+    } else {
+        format!("{} open call {}", q.trim(), (today + chrono::Duration::days(90)).year())
+    }
 }
 
 /// Read result pages at once for deadline, dates and amount; drop closed and passed calls.
@@ -2047,7 +2141,7 @@ fn run(tx: Sender<Msg>, today: NaiveDate) {
 /// Live results from earlier runs (data_dir/live.json), without passed deadlines.
 pub fn load_cache(today: NaiveDate) -> Vec<Opportunity> {
     let mut v: Vec<Opportunity> = read_user_list("live.json");
-    v.retain(|o| crate::model::parse_date(&o.deadline).map(|d| d >= today).unwrap_or(true));
+    v.retain(|o| crate::model::parse_date(&o.deadline).map(|d| d >= today).unwrap_or(true) && !junk_title(&o.name));
     v
 }
 
@@ -2094,6 +2188,20 @@ mod tests {
         assert_eq!(v[0].kind, "Residency");
         assert_eq!(v[1].deadline.as_deref(), Some("2026-12-31"));
         assert_eq!(v[1].amount_max, 10000);
+    }
+
+    /// CuratorSpace: the call's only text link is "More details" at the card's end.
+    #[test]
+    fn more_details_button_takes_name_and_card_text() {
+        let page = r#"<ul><li class="media"><a href='/opportunities/detail/reflection/11259' class="thumbnail"> <img src='x.jpg' title='x.jpg'></a>
+<h4 class="media-heading">Reflection/ Special Edition</h4><a href='/report?report=%2Fopportunities%2Fdetail%2Freflection%2F11259' class='report-this'>Report this?</a><div><strong>Deadline: 23/12/2026</strong><p class='details'><small>City: Tbilisi | <a href='https://www.curatorspace.com/profiles/fb29'>Collect Art</a></small></p></div><p class='description'>Collect Art invites artists working across all mediums.</p>
+<a href="/opportunities/detail/reflection/11259" class="btn-sm btn btn-info " title='Read more about Reflection/ Special Edition'>More details</a>
+</div></li><li class="media"><a href='/opportunities/detail/next/11287' class="thumbnail"><img src='y.jpg'></a>"#;
+        let v = harvest("CuratorSpace", "https://www.curatorspace.com/opportunities", page, today());
+        assert_eq!(v.len(), 1, "{:?}", v.iter().map(|o| &o.name).collect::<Vec<_>>());
+        assert_eq!(v[0].name, "Reflection/ Special Edition");
+        assert_eq!(v[0].apply_url, "https://www.curatorspace.com/opportunities/detail/reflection/11259");
+        assert_eq!(v[0].deadline.as_deref(), Some("2026-12-23"));
     }
 
     #[test]
@@ -2165,6 +2273,54 @@ mod tests {
         assert!(!junk_title("Win €10k: Sound Art Prize 2027"));
         assert!(!junk_title("Open Call AI and XR 2027"));
         assert!(junk_title("Member of Technical Staff (Open Role)"));
+        assert!(junk_title("Unitary Fund is awarded a NSF grant to grow the quantum open source ecosystem"));
+        assert!(junk_title("47 Open Source Projects Receive NLnet Grants to Boost Digital Autonomy"));
+        assert!(junk_title("62 new projects contribute to digital commons"));
+        assert!(junk_title("Read article: Preparing the web for post-quantum cryptography"));
+        assert!(junk_title("Past competitions"));
+        assert!(junk_title("Fabian Brinkmann"));
+        assert_eq!(web_query("spatial audio", NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()), "spatial audio open call 2026");
+        assert_eq!(web_query("spatial audio", NaiveDate::from_ymd_opt(2026, 11, 23).unwrap()), "spatial audio open call 2027");
+        assert!(junk_title("Di., 03.11.2026 19:30 Uhr Weimar, Hochschule für Musik, Festsaal"));
+        assert!(junk_title("Voraussetzungen für ein Studium"));
+        assert!(junk_title("Bachelor's admissions (programmes in English)"));
+        assert!(junk_title("Universitäten 53"));
+        assert!(junk_title("Report this?"));
+        assert!(!junk_title("Sound Art Prize 5"));
+        assert!(junk_title("nicht erforderlich 424"));
+        assert!(junk_title("Past Residencies"));
+        assert!(junk_title("Unsere aktuelle Stellenausschreibung"));
+        assert!(junk_title("Studiengänge A-Z"));
+        assert!(junk_title("Finished 50 24 AI Hacker House Equinox Edition"));
+        assert_eq!(decode_entities("Künstlerinnen&shy;förderung"), "Künstlerinnenförderung");
+        assert!(junk_title("© Volker Lannert / Universität Bonn"));
+        assert!(junk_title("Jury Statements 2026"));
+        assert_eq!(guess_kind("Workshop", "Registration required because space is limited. Premiere on Friday."), None);
+        assert_eq!(guess_kind("Workshop", "Anmeldung erforderlich"), None);
+        assert_eq!(guess_kind("Projektförderung Musik", "").as_deref(), Some("Grant"));
+        assert_eq!(guess_kind("Kunstpreis Berlin", "").as_deref(), Some("Prize"));
+        assert_eq!(guess_kind("Becas de creación 2027", "").as_deref(), Some("Stipend"));
+        assert_eq!(guess_kind("Open source funds", "").as_deref(), Some("Grant"));
+        assert!(junk_title("10 weitere Ergebnisse laden"));
+        assert_eq!(strip_tags(r#"<div x-trap="open && n > 1" :class="{a: 1}">DFG Funding</div> a < b"#), "DFG Funding a < b");
+        assert_eq!(strip_tags("GERiT </a> </li>\n<li class=\"x\">\n<a\nhref=\"https://risources.dfg.de/home_en"), "GERiT");
+        assert!(!junk_title("Hackathon 2027"));
+        let o = |name: &str, url: &str, deadline: Option<&str>| -> Opportunity {
+            serde_json::from_value(serde_json::json!({"id": "x", "name": name, "kind": "Prize", "scope": "World", "apply_url": url, "deadline": deadline})).unwrap()
+        };
+        assert!(is_passed(&o("Calling All Console Cowboys!", "https://hackaday.io/contest/191511-cyberdeck-2023", None), today()));
+        assert!(!is_passed(&o("EU call", "https://ec.europa.eu/topic-details/HORIZON-CL4-2025-01", Some("2027-03-01")), today()));
+        assert!(!junk_title("Announcing the Open Call 2027 for sound art"));
+        assert!(junk_title("Open Call 2026 winners announced"));
+        assert_eq!(web_query("sound art residency", today()), "sound art residency");
+        assert_eq!(web_query("Klangkunst Förderung", today()), "Klangkunst Förderung");
+        assert!(junk_title("https://homiens.com/homiens-art-prize"));
+        assert!(!junk_title("Sound Art Prize"));
+        assert!(!junk_title("Open Call"));
+        assert!(!junk_title("Elektroakustische Musik"));
+        assert!(junk_title("Read our full announcement"));
+        assert!(junk_title("NLnet announces 60 projects"));
+        assert!(!junk_title("Apply to receive a grant for open source projects"));
         assert!(stale("unitaryHACK 2022: quantum open source", today()));
         assert!(!stale("Hackathon 2026/2027", today()));
         assert!(!stale("Open call for sound art", today()));

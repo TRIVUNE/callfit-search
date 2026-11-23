@@ -1,12 +1,13 @@
 //! The list filter (`/`): words, "phrases" and -exclusions, matched at word starts, across the
 //! 8 crawl languages, with one typo forgiven when nothing matches exactly.
+//! Skips filler words, matches word forms, and offers a loose mode that matches only some words.
 
 use crate::live::fold;
 
 /// Words that mean the same in EN DE FR ES IT NL PT PL (plus Nordic where common). A search word
 /// that finds one member also finds the others. Written plain; `fold` runs on them.
 const SYNONYMS: &[&[&str]] = &[
-    &["grant", "funding", "förderung", "förderprogramm", "zuschuss", "subvention", "financement", "subvencion", "ayuda", "sovvenzione", "finanziamento", "contributo", "subsidie", "dofinansowanie", "financiamento", "fomento"],
+    &["grant", "funding", "förderung", "förderprogramm", "zuschuss", "subvention", "financement", "subvencion", "ayuda", "sovvenzione", "finanziamento", "contributo", "subsidie", "dofinansowanie", "financiamento", "fomento", "money", "cash", "geld", "argent", "dinero", "soldi", "pieniądze"],
     &["stipend", "scholarship", "stipendium", "bourse", "beca", "borsa", "beurs", "stypendium", "bolsa"],
     &["residency", "residence", "residencies", "residenz", "residencia", "residenza", "residentie", "rezydencja", "residência", "artist in residence"],
     &["prize", "award", "preis", "auszeichnung", "prix", "premio", "prijs", "nagroda", "prémio"],
@@ -24,7 +25,7 @@ const SYNONYMS: &[&[&str]] = &[
     &["artist", "künstler", "künstlerin", "artiste", "artista", "kunstenaar", "artysta", "konstnär", "kunstner"],
     &["sound", "klang", "sonido", "suono", "geluid", "dźwięk", "ljud", "lyd", "sonore", "sonoro", "sonora"],
     &["sound art", "klangkunst", "art sonore", "arte sonoro", "arte sonora", "geluidskunst", "sztuka dźwięku", "ljudkonst", "lydkunst", "audio art"],
-    &["music", "musik", "musique", "musica", "música", "muziek", "muzyka", "musikk"],
+    &["music", "musik", "musique", "musica", "música", "muziek", "muzyka", "musikk", "musician", "musicians", "musiker", "musicien", "músico", "musicista", "muzikant", "muzyk"],
     &["composition", "composer", "komposition", "komponist", "compositeur", "compositor", "compositore", "componist", "kompozytor", "kompozycja", "composicion", "composizione", "compositie", "call for scores"],
     &["electronic music", "elektronische musik", "musique électronique", "música electrónica", "musica elettronica", "elektronische muziek", "muzyka elektroniczna", "electroacoustic", "elektroakustisch", "électroacoustique", "electroacústica", "elettroacustica"],
     &["media art", "medienkunst", "new media", "digital art", "arts numériques", "art numérique", "arte digital", "arte digitale", "digitale kunst", "sztuka cyfrowa", "sztuka mediów", "mediakunst"],
@@ -48,6 +49,26 @@ const SYNONYMS: &[&[&str]] = &[
     &["young", "emerging", "nachwuchs", "émergent", "emergente", "jong", "młody"],
 ];
 
+/// Filler words ignored unless quoted or negated. Written folded; `fold` runs on query words.
+const STOPWORDS: &[&str] = &[
+    // en
+    "a", "an", "the", "and", "or", "for", "of", "to", "in", "on", "at", "with", "by", "from", "my", "our", "your", "about",
+    // de
+    "der", "die", "das", "und", "oder", "fur", "von", "zu", "im", "am", "mit", "ein", "eine",
+    // fr
+    "le", "la", "les", "des", "du", "de", "et", "ou", "pour", "un", "une", "avec", "en", "au", "aux",
+    // es
+    "el", "los", "las", "y", "o", "para", "del", "con",
+    // it
+    "il", "lo", "gli", "e", "per", "di",
+    // nl
+    "het", "een", "voor", "van", "met", "op",
+    // pt
+    "os", "as", "do", "da", "com", "um", "uma", "em",
+    // pl
+    "i", "oraz", "dla", "w", "z", "na",
+];
+
 /// One way a search term can match: words in a row, or (an unquoted pair like `sound art`) each
 /// anywhere.
 struct Alt {
@@ -66,10 +87,23 @@ pub struct Query {
     terms: Vec<Term>,
     /// forgive one typo (used when nothing matches exactly)
     fuzzy: bool,
+    /// match entries that contain only some of the words
+    any: bool,
 }
 
 fn words(s: &str) -> Vec<String> {
     fold(s).split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+}
+
+/// Do two words share a long enough prefix to be forms of the same word?
+fn same_stem(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len() < 5 || b.len() < 5 {
+        return false;
+    }
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    common >= 5 && common * 4 >= a.len().min(b.len()) * 3
 }
 
 /// Damerau-Levenshtein from `p` to the closest prefix of `t` is at most 1.
@@ -98,7 +132,7 @@ fn close(p: &str, t: &str) -> bool {
 fn word_q(p: &str, t: &str, typed: bool, fuzzy: bool) -> u32 {
     if t == p {
         3
-    } else if (typed || p.len() >= 4) && t.starts_with(p) {
+    } else if (typed || p.len() >= 4) && t.starts_with(p) || same_stem(p, t) {
         2
     } else if p.len() >= 5 && t.contains(p) {
         1 // inside a compound: "kunst" in "klangkunst"
@@ -150,7 +184,7 @@ impl Query {
         let mut terms = vec![];
         let mut i = 0;
         while i < items.len() {
-            let (neg, w, _) = &items[i];
+            let (neg, w, quoted) = &items[i];
             // unquoted words that together name a group member ("sound art", "open call"): one term
             let mut joined = None;
             for n in [3, 2] {
@@ -170,11 +204,15 @@ impl Query {
                     (n, alts)
                 }
                 None => {
+                    if !*neg && !*quoted && w.len() == 1 && STOPWORDS.contains(&w[0].as_str()) {
+                        i += 1;
+                        continue;
+                    }
                     let mut alts = vec![Alt { words: w.clone(), in_a_row: true, typed: true }];
                     // a word finds a group by a member's start, a phrase only by a whole member
                     let p = &w[0];
                     alts.extend(expand(&|m| {
-                        m == w || (w.len() == 1 && m.len() == 1 && (p.len() >= 4 && m[0].starts_with(p.as_str()) || fuzzy && p.len() >= 5 && close(p, &m[0])))
+                        m == w || (w.len() == 1 && m.len() == 1 && (p.len() >= 4 && m[0].starts_with(p.as_str()) || fuzzy && p.len() >= 5 && close(p, &m[0]) || same_stem(p, &m[0])))
                     }));
                     (1, alts)
                 }
@@ -184,7 +222,17 @@ impl Query {
             terms.push(Term { alts, neg: *neg });
             i += n;
         }
-        Query { terms, fuzzy }
+        Query { terms, fuzzy, any: false }
+    }
+
+    /// Match entries containing only some of the words; each match adds to the score.
+    pub fn loose(mut self) -> Query {
+        self.any = true;
+        self
+    }
+
+    pub fn is_loose(&self) -> bool {
+        self.any
     }
 
     pub fn is_empty(&self) -> bool {
@@ -224,13 +272,26 @@ impl Query {
         }
         let fields: Vec<(u32, Vec<String>)> = fields.iter().map(|(w, s)| (*w, words(s))).collect();
         let mut total = 0;
+        let mut matched = false;
         for t in &self.terms {
             let best = t.alts.iter().map(|a| self.alt_score(a, &fields)).max().unwrap_or(0);
-            match (t.neg, best > 0) {
-                (true, true) | (false, false) => return None,
-                (false, true) => total += best,
-                _ => {}
+            if t.neg {
+                if best > 0 {
+                    return None;
+                }
+                continue;
             }
+            if best == 0 {
+                if !self.any {
+                    return None;
+                }
+                continue;
+            }
+            matched = true;
+            total += if self.any { 1000 + best } else { best };
+        }
+        if self.any && !matched {
+            return None;
         }
         Some(total)
     }
@@ -302,5 +363,28 @@ mod tests {
         let in_summary = q.score(&[(6, "Research prize"), (2, "quantum computing")]).unwrap();
         assert!(in_name > in_summary);
         assert!(q.hits("Quantum") && !q.hits("prize"));
+    }
+
+    #[test]
+    fn plain_sentences() {
+        assert!(find("money for musicians", "Grant for music projects"));
+        assert!(find("money for musicians", "Förderung Musik"));
+        assert!(!find("\"for\"", "Grant"));
+        assert!(find("artist in residence", "Residenz für Künstler"));
+        assert!(find("residencies", "Artist residency"));
+        assert!(find("musicians", "Music prize"));
+        assert!(!find("compose", "computer lab"));
+    }
+
+    #[test]
+    fn loose_mode() {
+        let q = Query::parse("quantum reverb zebra", false);
+        assert!(q.score(&[(1, "quantum reverb")]).is_none());
+        let loose = q.loose();
+        let both = loose.score(&[(1, "quantum reverb")]);
+        assert!(both.is_some());
+        let one = loose.score(&[(1, "quantum only")]);
+        assert!(both.unwrap() > one.unwrap());
+        assert!(Query::parse("quantum -zebra", false).loose().score(&[(1, "zebra crossing")]).is_none());
     }
 }

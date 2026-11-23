@@ -2,7 +2,7 @@
 name = "callfit"
 version = "0.3.0"
 edition = "2021"
-description = "Find funding, open calls and residencies that fit Trivune. A terminal app in the style of llmfit."
+description = "Find funding, open calls and residencies that fit Trivune. A terminal app."
 license = "MIT"
 
 [dependencies]

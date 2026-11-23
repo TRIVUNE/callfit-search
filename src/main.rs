@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Row, Table, TableState, Wrap},
     DefaultTerminal, Frame,
 };
 use std::collections::{HashMap, HashSet};
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-/// llmfit look: Tokyo Night Moon (dark) and Tokyo Night Day (light).
+/// Trivune look: charcoal or light grey, Trivune red for problems.
 struct Theme {
     bg: Color,
     /// title bar
@@ -36,30 +36,30 @@ struct Theme {
     red: Color,
 }
 const DARK: Theme = Theme {
-    bg: Color::Rgb(0x22, 0x24, 0x36),
-    bar: Color::Rgb(0x1e, 0x20, 0x30),
-    fg: Color::Rgb(0xc8, 0xd3, 0xf5),
-    dim: Color::Rgb(0x82, 0x8b, 0xb8),
-    border: Color::Rgb(0x3b, 0x42, 0x61),
-    sel: Color::Rgb(0x2f, 0x33, 0x4d),
-    green: Color::Rgb(0xc3, 0xe8, 0x8d),
-    blue: Color::Rgb(0x82, 0xaa, 0xff),
-    cyan: Color::Rgb(0x86, 0xe1, 0xfc),
-    yellow: Color::Rgb(0xff, 0xc7, 0x77),
-    red: Color::Rgb(0xff, 0x75, 0x7f),
+    bg: Color::Rgb(0x1c, 0x1c, 0x1c),
+    bar: Color::Rgb(0x14, 0x14, 0x14),
+    fg: Color::Rgb(0xec, 0xec, 0xec),
+    dim: Color::Rgb(0x9a, 0x9a, 0x9a),
+    border: Color::Rgb(0x3a, 0x3a, 0x3a),
+    sel: Color::Rgb(0x2e, 0x2e, 0x2e),
+    green: Color::Rgb(0x8f, 0xc0, 0x8a),
+    blue: Color::Rgb(0x9a, 0xb0, 0xc2),
+    cyan: Color::Rgb(0x7f, 0xb8, 0xab),
+    yellow: Color::Rgb(0xe0, 0xa8, 0x4e),
+    red: Color::Rgb(0xf2, 0x55, 0x5a),
 };
 const LIGHT: Theme = Theme {
-    bg: Color::Rgb(0xe1, 0xe2, 0xe7),
-    bar: Color::Rgb(0xd0, 0xd5, 0xe3),
-    fg: Color::Rgb(0x37, 0x60, 0xbf),
-    dim: Color::Rgb(0x61, 0x72, 0xb0),
-    border: Color::Rgb(0xa8, 0xae, 0xcb),
-    sel: Color::Rgb(0xc4, 0xc8, 0xda),
-    green: Color::Rgb(0x58, 0x75, 0x39),
-    blue: Color::Rgb(0x2e, 0x7d, 0xe9),
-    cyan: Color::Rgb(0x00, 0x71, 0x97),
-    yellow: Color::Rgb(0x8c, 0x6c, 0x3e),
-    red: Color::Rgb(0xf5, 0x2a, 0x65),
+    bg: Color::Rgb(0xec, 0xec, 0xec),
+    bar: Color::Rgb(0xde, 0xde, 0xde),
+    fg: Color::Rgb(0x11, 0x11, 0x11),
+    dim: Color::Rgb(0x55, 0x55, 0x55),
+    border: Color::Rgb(0xc8, 0xc8, 0xc8),
+    sel: Color::Rgb(0xdc, 0xdc, 0xdc),
+    green: Color::Rgb(0x2f, 0x6e, 0x3a),
+    blue: Color::Rgb(0x3d, 0x5a, 0x73),
+    cyan: Color::Rgb(0x1f, 0x66, 0x5c),
+    yellow: Color::Rgb(0x85, 0x55, 0x00),
+    red: Color::Rgb(0xb3, 0x12, 0x1b),
 };
 static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
 
@@ -90,7 +90,7 @@ const READ_TOP: usize = 10;
 
 const KINDS: &[&str] = &["All", "Grant", "Prize", "Stipend", "Residency", "Fellowship", "Call for papers", "Open call", "Competition", "Hackathon", "Conference", "Accelerator", "Live"];
 const REGIONS: &[&str] = &["All", "Berlin", "DE", "EU", "World"];
-const FITS: &[&str] = &["Eligible", "Perfect+Good", "All"];
+const FITS: &[&str] = &["Eligible", "Strong+Worth it", "All"];
 const STATUSES: &[&str] = &["All", "Open now", "Upcoming"];
 const SORTS: &[&str] = &["Score", "Match", "Deadline", "Amount", "Name"];
 const VIEWS: &[&str] = &["All", "Tracked"];
@@ -215,7 +215,7 @@ impl App {
                 }
                 match FITS[self.fit] {
                     "Eligible" if s.fit == FitLevel::NotEligible => return false,
-                    "Perfect+Good" if !matches!(s.fit, FitLevel::Perfect | FitLevel::Good) => return false,
+                    "Strong+Worth it" if !matches!(s.fit, FitLevel::Perfect | FitLevel::Good) => return false,
                     _ => {}
                 }
                 match STATUSES[self.status] {
@@ -231,7 +231,7 @@ impl App {
             })
             .collect();
         let all = &self.all;
-        // relevance per entry; with no exact match, allow one typo per word
+        // relevance per entry; with no exact match, allow one typo per word, then match some of the words
         let find = |q: &search::Query| -> Vec<(usize, u32)> { base.iter().filter_map(|&i| relevance(q, &all[i].opp).map(|r| (i, r))).collect() };
         let mut q = search::Query::parse(&self.query, false);
         let mut hits = find(&q);
@@ -240,6 +240,10 @@ impl App {
             q = search::Query::parse(&self.query, true);
             hits = find(&q);
             self.close_matches = !hits.is_empty();
+            if hits.is_empty() {
+                q = q.loose();
+                hits = find(&q);
+            }
         }
         let mut rel = vec![0u32; all.len()];
         for &(i, r) in &hits {
@@ -267,8 +271,12 @@ impl App {
             }),
             "Match" => idx.sort_by(|&a, &b| all[b].match10.cmp(&all[a].match10).then(all[b].overall.partial_cmp(&all[a].overall).unwrap())),
             "Name" => idx.sort_by(|&a, &b| all[a].opp.name.to_lowercase().cmp(&all[b].opp.name.to_lowercase())),
-            // best matches first, then by score
-            _ => idx.sort_by(|&a, &b| rel[b].cmp(&rel[a]).then(all[b].overall.partial_cmp(&all[a].overall).unwrap())),
+            // fit score, lifted up to 2x by how well the entry matches the search (best match = 2x)
+            _ => {
+                let top = rel.iter().max().copied().unwrap_or(0).max(1) as f32;
+                let key = |i: usize| all[i].overall * (1.0 + rel[i] as f32 / top);
+                idx.sort_by(|&a, &b| key(b).partial_cmp(&key(a)).unwrap());
+            }
         }
         self.search = q;
         self.shown = idx;
@@ -425,6 +433,9 @@ impl App {
                     let mut kept: HashMap<String, Opportunity> = kept.into_iter().map(|o| (o.id.clone(), o)).collect();
                     let old = std::mem::take(&mut self.web_results);
                     self.web_results = old.into_iter().filter_map(|o| if ids.contains(&o.id) { kept.remove(&o.id) } else { Some(o) }).collect();
+                    // pages read: dates and amounts known, so best fit first
+                    let (p, today) = (&self.profile, self.today);
+                    self.web_results.sort_by_cached_key(|o| std::cmp::Reverse((score(o, p, today).overall * 10.0) as i64));
                     let n = self.web_results.len();
                     let at = self.web_results.iter().position(|o| Some(&o.id) == sel.as_ref()).unwrap_or(at.min(n.saturating_sub(1)));
                     self.web_list.select(if n > 0 { Some(at) } else { None });
@@ -592,7 +603,7 @@ fn bold(c: Color) -> Style {
 /// A rounded panel; `active` lights the border.
 fn panel(title: Line<'static>, active: bool) -> Block<'static> {
     let t = th();
-    Block::bordered().border_type(BorderType::Rounded).border_style(fg(if active { t.green } else { t.border })).title(title)
+    Block::bordered().border_style(fg(if active { t.fg } else { t.border })).title(title)
 }
 
 /// One search box: title, key on the right, placeholder when empty.
@@ -737,7 +748,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         Line::from(vec![
             Span::styled(" Opportunities ", bold(t.blue)),
             Span::styled(format!("{} of {} ", app.shown.len(), app.all.len()), fg(t.dim)),
-            Span::styled(if app.close_matches { "· no exact match, showing close spellings " } else { "" }, fg(t.yellow)),
+            Span::styled(
+                if app.search.is_loose() { "· no entry has every word, showing the closest " } else if app.close_matches { "· no exact match, showing close spellings " } else { "" },
+                fg(t.yellow),
+            ),
         ]),
         false,
     ));
@@ -800,7 +814,8 @@ fn ui(f: &mut Frame, app: &mut App) {
                 if o.amount_max > 0 {
                     meta.push(fmt_amount(o));
                 }
-                meta.push(format!("match {}/10", score(o, &app.profile, app.today).match10));
+                let s = score(o, &app.profile, app.today);
+                meta.push(format!("{} · match {}/10", s.fit.label(), s.match10));
                 let mut info = vec![Span::styled(meta.join(" · "), fg(t.yellow))];
                 if let Some(w) = o.warnings.first() {
                     info.push(Span::styled(format!("  ⚠ {}", w), fg(t.red)));
@@ -909,7 +924,7 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
 
     l.push(Line::raw(""));
     l.push(section("Trivune fit"));
-    l.push(Line::from(vec![Span::styled("Fit Level:    ", fg(t.dim)), Span::styled(format!("● {}", s.fit.label()), bold(fit_color(s.fit)))]));
+    l.push(Line::from(vec![Span::styled("Fit:          ", fg(t.dim)), Span::styled(format!("● {}", s.fit.label()), bold(fit_color(s.fit)))]));
     for c in &s.checks {
         let (m, col) = if c.ok { ("✓", t.green) } else { ("✗", t.red) };
         l.push(Line::from(vec![Span::styled(format!("  {} ", m), fg(col)), Span::styled(c.text.clone(), fg(if c.ok { t.fg } else { t.dim }))]));
@@ -999,8 +1014,8 @@ fn run(mut term: DefaultTerminal) -> std::io::Result<()> {
         }
         if app.mode == Mode::Search {
             match k.code {
-                // nothing in the list matches: look on the web instead
-                KeyCode::Enter if app.shown.is_empty() && !app.query.trim().is_empty() => {
+                // nothing in the list has every word: look on the web instead
+                KeyCode::Enter if (app.shown.is_empty() || app.search.is_loose()) && !app.query.trim().is_empty() => {
                     app.web_query = app.query.clone();
                     app.start_web();
                 }

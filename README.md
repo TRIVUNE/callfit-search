@@ -1,6 +1,6 @@
 # callfit
 
-Find funding, open calls, residencies and paper calls that fit **Trivune**. A terminal app in the style of [llmfit](https://www.llmfit.org/), written in Rust.
+Find funding, open calls, residencies and paper calls that fit **Trivune**. A terminal app written in Rust.
 
 callfit scores each opportunity against your profile and shows a fit level, a score breakdown, the money, the deadline and the apply link.
 
@@ -49,10 +49,10 @@ If `scoop` is not found after the install, open a new terminal.
 | `Enter` | Open the call page |
 | `i` | Open the page it was found on |
 | `p` | Track: Watching → Drafting → Submitted → Won → Rejected |
-| `/` | Filter the list. Words match at their start (`art` finds `artist`, not `start`) and in 8 languages (`residency` finds `Residenz`, `résidence`, `residencia`). `"sound art"` matches the phrase, `-word` excludes, accents are ignored. Name matches come first. With no exact match, one typo is forgiven. If nothing matches, `Enter` searches the web |
+| `/` | Filter the list. Words match at their start (`art` finds `artist`, not `start`) and in 8 languages (`residency` finds `Residenz`, `résidence`, `residencia`). `"sound art"` matches the phrase, `-word` excludes, accents are ignored, filler words (`for`, `the`, `für`...) are skipped. Better matches rank higher. With no exact match, one typo is forgiven; then entries with only some of the words show. If no entry has every word, `Enter` searches the web |
 | `t` | Filter by type |
 | `r` | Filter by region (Berlin, DE, EU, World) |
-| `f` | Filter by fit (Eligible, Perfect+Good, All) |
+| `f` | Filter by fit (Eligible, Strong+Worth it, All) |
 | `o` | Filter by status (Open now, Upcoming). Passed deadlines are never shown |
 | `s` | Sort (Score, Match, Deadline, Amount, Name) |
 | `v` | Show tracked only |
@@ -95,7 +95,7 @@ Add your own sources in `feeds.json`, and your own search queries in `queries.js
 | Money | 15% | Amount, on a log scale |
 | Timing | 15% | Open with time left scores high; closed scores low |
 
-Fit levels: **Perfect** (80+, no missing requirement, not closed), **Good** (62+), **Marginal** (45+), **Low**, **Not eligible** (wrong region or applicant type).
+Fit levels: **Strong** (75+, no missing requirement, not closed), **Worth it** (55+), **Long shot** (35+), **Weak**, **Not eligible** (wrong region or applicant type). The score is eligibility × (55% topic match + 20% money + 25% timing); topics in the profile's `avoid` list and budgets over 250k push a call down.
 
 ## Your data
 

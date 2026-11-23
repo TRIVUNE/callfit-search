@@ -81,6 +81,9 @@ pub struct Profile {
     pub has: Vec<String>,
     /// What you do; used for relevance
     pub interests: Vec<String>,
+    /// Topics that push a call down (off-topic for you)
+    #[serde(default)]
+    pub avoid: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -116,10 +119,10 @@ pub enum FitLevel {
 impl FitLevel {
     pub fn label(&self) -> &'static str {
         match self {
-            FitLevel::Perfect => "Perfect",
-            FitLevel::Good => "Good",
-            FitLevel::Marginal => "Marginal",
-            FitLevel::Low => "Low",
+            FitLevel::Perfect => "Strong",
+            FitLevel::Good => "Worth it",
+            FitLevel::Marginal => "Long shot",
+            FitLevel::Low => "Weak",
             FitLevel::NotEligible => "Not eligible",
         }
     }
@@ -182,6 +185,18 @@ fn norm(s: &str) -> String {
     s.to_lowercase()
 }
 
+/// Single words match anywhere ("acoustic" in "electroacoustics"); a multi-word term must end
+/// at a word end, plural allowed, so "generative art" misses "generative artificial".
+fn has_term(hay: &str, term: &str) -> bool {
+    if !term.contains(' ') {
+        return hay.contains(term);
+    }
+    hay.match_indices(term).any(|(i, _)| {
+        let rest = &hay[i + term.len()..];
+        !rest.strip_prefix('s').unwrap_or(rest).starts_with(char::is_alphanumeric)
+    })
+}
+
 pub fn score(o: &Opportunity, p: &Profile, today: NaiveDate) -> Scored {
     let mut checks = Vec::new();
     let mut hard_fail = false;
@@ -210,51 +225,101 @@ pub fn score(o: &Opportunity, p: &Profile, today: NaiveDate) -> Scored {
         hard_fail = true;
     }
 
-    // --- requirements
+    // --- requirements: an unverified listing costs 15%, any other miss 40%
     let mut missing = 0u32;
+    let mut eligible = 100.0f32;
     for r in &o.requires {
         let ok = p.has.iter().any(|h| norm(h) == norm(r));
         if !ok {
             missing += 1;
+            eligible *= if norm(r) == "unverified" { 0.85 } else { 0.6 };
         }
         checks.push(Check { ok, text: requirement_label(r).to_string() });
     }
-    let eligibility = if hard_fail { 0 } else { 100u32.saturating_sub(missing * 35) };
+    let eligibility = if hard_fail { 0 } else { eligible.round() as u32 };
 
     // --- relevance / match 0-10. Half points: an interest in the name = 4, in summary or tags = 2;
-    // broad interests (research, software...) count half. 12 half points = 10/10.
+    // broad interests (research, software...) count half. 14 half points = 10/10.
+    // A match made only of broad interests caps at 4/10.
     const BROAD: &[&str] = &["digital", "research", "software", "tools", "education", "workshops", "interfaces", "instruments", "plugin", "music", "immersive"];
     let fold = crate::live::fold;
     let name_f = fold(&o.name);
     let rest_f = fold(&format!("{} {}", o.summary, o.tags.join(" ")));
     let mut points = 0u32;
     let mut matched = Vec::new();
+    let mut name_specific = false;
     for i in &p.interests {
         let f = fold(i);
         if f.is_empty() {
             continue;
         }
         let w = if BROAD.contains(&f.as_str()) { 1 } else { 2 };
-        if name_f.contains(&f) {
+        if has_term(&name_f, &f) {
             points += 2 * w;
-        } else if rest_f.contains(&f) {
+            name_specific |= w == 2;
+        } else if has_term(&rest_f, &f) {
             points += w;
         } else {
             continue;
         }
         matched.push(i.clone());
     }
-    let match10 = (points * 10 / 12).min(10) as u8;
+    let mut match10 = (points * 10 / 14).min(10) as u8;
+    if !matched.is_empty() && matched.iter().all(|m| {
+        let f = fold(m);
+        BROAD.contains(&f.as_str())
+    }) {
+        match10 = match10.min(4);
+    }
+    // a live paper call or conference whose title names none of your specific topics is a general one (AI, data...)
+    if o.confidence == "live" && matches!(o.kind.as_str(), "Call for papers" | "Conference") && !name_specific && match10 > 0 {
+        match10 /= 2;
+        checks.push(Check { ok: false, text: "General paper call: title names none of your topics".into() });
+    }
+
+    // --- avoid topics: a name hit costs 60%, a tag/summary hit 30%
+    let mut factor = 1.0f32;
+    let mut avoid_word = "";
+    for a in &p.avoid {
+        let f = fold(a);
+        if f.is_empty() {
+            continue;
+        }
+        let hit = if name_f.contains(&f) {
+            0.4
+        } else if rest_f.contains(&f) {
+            0.7
+        } else {
+            continue;
+        };
+        if hit < factor {
+            factor = hit;
+            avoid_word = a;
+        }
+    }
+    if factor < 1.0 {
+        match10 = (match10 as f32 * factor).round() as u8;
+        checks.push(Check { ok: false, text: format!("Off-topic for you: {}", avoid_word) });
+    }
     let relevance = match10 as u32 * 10;
 
-    // --- money (rough EUR)
+    // --- money (rough EUR): log curve under 50k, then flat bands; over 250k is flagged
     let amt = o.amount_max.max(o.amount_min) as f64;
     let money = if amt <= 0.0 {
-        if o.kind == "Call for papers" { 20 } else { 35 }
-    } else {
-        // 1k -> 30, 5k -> 60, 20k -> 85, 50k+ -> 100
+        if o.kind == "Call for papers" { 15 } else { 35 }
+    } else if amt < 50_000.0 {
+        // 1k -> 30, 5k -> 60, 20k -> 83
         ((amt.log10() - 3.0) / (4.7 - 3.0) * 70.0 + 30.0).clamp(20.0, 100.0) as u32
+    } else if amt <= 250_000.0 {
+        100
+    } else if amt <= 1_000_000.0 {
+        50
+    } else {
+        25
     };
+    if amt > 250_000.0 {
+        checks.push(Check { ok: false, text: "Budget over 250k: usually for institutions, or misread".into() });
+    }
 
     // --- timing
     let dl = parse_date(&o.deadline);
@@ -278,7 +343,7 @@ pub fn score(o: &Opportunity, p: &Profile, today: NaiveDate) -> Scored {
     };
     let timing = match status {
         // dates guessed from last year's pattern: the round is not announced yet
-        Status::Open | Status::Upcoming if o.confidence == "pattern" => 40,
+        Status::Open | Status::Upcoming if o.confidence == "pattern" => 55,
         Status::Open => match days_left.unwrap_or(99) {
             d if d >= 21 => 100,
             d if d >= 7 => 80,
@@ -295,18 +360,17 @@ pub fn score(o: &Opportunity, p: &Profile, today: NaiveDate) -> Scored {
         Status::Closed => 15,
     };
 
-    let overall = 0.40 * eligibility as f32
-        + 0.30 * relevance as f32
-        + 0.15 * money as f32
-        + 0.15 * timing as f32;
+    // eligibility scales the weighted sum: relevance 55%, money 20%, timing 25%
+    let overall = eligibility as f32 / 100.0
+        * (0.55 * relevance as f32 + 0.20 * money as f32 + 0.25 * timing as f32);
 
     let fit = if hard_fail {
         FitLevel::NotEligible
-    } else if overall >= 80.0 && missing == 0 && timing >= 50 {
+    } else if overall >= 75.0 && missing == 0 && timing >= 50 {
         FitLevel::Perfect
-    } else if overall >= 62.0 {
+    } else if overall >= 55.0 {
         FitLevel::Good
-    } else if overall >= 45.0 {
+    } else if overall >= 35.0 {
         FitLevel::Marginal
     } else {
         FitLevel::Low
@@ -374,15 +438,20 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub fn load_profile() -> Profile {
+    let default: Profile = serde_json::from_str(DEFAULT_PROFILE).expect("built-in profile is valid");
     let path = data_dir().join("profile.json");
     if let Ok(s) = std::fs::read_to_string(&path) {
-        if let Ok(p) = serde_json::from_str(&s) {
+        if let Ok(mut p) = serde_json::from_str::<Profile>(&s) {
+            // old saved profiles have no avoid list; an emptied one stays empty
+            if !s.contains("\"avoid\"") {
+                p.avoid = default.avoid;
+            }
             return p;
         }
     } else {
         let _ = std::fs::write(&path, DEFAULT_PROFILE);
     }
-    serde_json::from_str(DEFAULT_PROFILE).expect("built-in profile is valid")
+    default
 }
 
 /// Built-in list, overridden/extended by data_dir/opportunities.json (merged by id).
@@ -464,5 +533,80 @@ pub fn load_tracker() -> HashMap<String, Track> {
 pub fn save_tracker(t: &HashMap<String, Track>) {
     if let Ok(s) = serde_json::to_string_pretty(t) {
         let _ = std::fs::write(data_dir().join("tracker.json"), s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, 22).unwrap()
+    }
+
+    fn deadline() -> String {
+        (today() + chrono::Duration::days(60)).format("%Y-%m-%d").to_string()
+    }
+
+    fn opp(json: &str) -> Opportunity {
+        serde_json::from_str(json).expect("test opportunity is valid JSON")
+    }
+
+    fn profile() -> Profile {
+        serde_json::from_str(DEFAULT_PROFILE).expect("built-in profile is valid")
+    }
+
+    #[test]
+    fn on_topic_verified_grant_out_scores_off_topic_live_call() {
+        let p = profile();
+        let a = opp(&format!(
+            r#"{{"id":"a","name":"Spatial audio and DSP open source grant","kind":"Grant","scope":"World","amount_min":20000,"amount_max":20000,"deadline":"{}","tags":["spatial audio","dsp","open source"],"confidence":"verified"}}"#,
+            deadline()
+        ));
+        let b = opp(&format!(
+            r#"{{"id":"b","name":"Postdoctoral fellowship in plant biology","kind":"Fellowship","scope":"World","amount_max":8000000,"deadline":"{}","requires":["unverified"],"tags":["research"],"confidence":"live"}}"#,
+            deadline()
+        ));
+        let sa = score(&a, &p, today());
+        let sb = score(&b, &p, today());
+
+        assert!(sa.overall > sb.overall);
+        assert!(sa.overall >= 75.0);
+        assert_eq!(sa.fit, FitLevel::Perfect);
+        assert!(matches!(sb.fit, FitLevel::Marginal | FitLevel::Low));
+        assert!(sb.checks.iter().any(|c| !c.ok && c.text.starts_with("Off-topic")));
+        assert!(sb.checks.iter().any(|c| !c.ok && c.text.starts_with("Budget over 250k")));
+    }
+
+    #[test]
+    fn general_paper_call_ranks_below_specific_one() {
+        let p = profile();
+        let call = |name: &str| {
+            opp(&format!(
+                r#"{{"id":"x","name":"{}","kind":"Call for papers","scope":"World","deadline":"{}","requires":["unverified"],"tags":["machine learning","education","signal processing"],"confidence":"live"}}"#,
+                name,
+                deadline()
+            ))
+        };
+        let general = score(&call("GAIE 2027: Conference on Generative Artificial Intelligence and Education"), &p, today());
+        let specific = score(&call("ICASSP 2027: Conference on Acoustics, Speech and Signal Processing"), &p, today());
+        assert!(specific.overall > general.overall);
+        assert!(general.checks.iter().any(|c| !c.ok && c.text.starts_with("General paper call")));
+    }
+
+    #[test]
+    fn multi_word_terms_end_at_word_end() {
+        assert!(!has_term("generative artificial intelligence", "generative art"));
+        assert!(has_term("generative art prize", "generative art"));
+        assert!(has_term("open calls for sound arts", "sound art"));
+        assert!(has_term("acoustics", "acoustic"));
+    }
+
+    #[test]
+    fn out_of_scope_is_not_eligible() {
+        let c = opp(r#"{"id":"c","name":"Spatial audio grant","kind":"Grant","scope":"US","amount_max":20000}"#);
+        let sc = score(&c, &profile(), today());
+        assert_eq!(sc.fit, FitLevel::NotEligible);
+        assert_eq!(sc.overall, 0.0);
     }
 }

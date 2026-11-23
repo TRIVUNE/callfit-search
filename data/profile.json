@@ -14,5 +14,6 @@
     "pure mathematics", "algebra", "number theory", "combinatorics", "topology", "geometry", "dsp",
     "acoustics", "speech", "creative coding", "game audio", "virtual reality", "synthesizer", "open hardware",
     "plugin", "music information retrieval", "generative art", "quantum"
-  ]
+  ],
+  "avoid": ["biology", "ecology", "plant", "medicine", "medical", "clinical", "health", "disease", "neurodegenerative", "chemistry", "agriculture", "business", "management", "marketing", "economics"]
 }
