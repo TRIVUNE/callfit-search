@@ -1,6 +1,6 @@
 [package]
 name = "callfit"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Find funding, open calls and residencies that fit Trivune. A terminal app."
 license = "MIT"
